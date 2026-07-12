@@ -25,7 +25,7 @@ Install Xcode command-line tools and make `zenc` available at `../zenc`, then:
 ./hello-mac
 ```
 
-The build returns a target plan and attaches native requirements to macOS only:
+The build registers an executable and attaches native requirements to macOS only:
 
 ```zen
 exe("hello-mac")
