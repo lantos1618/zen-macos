@@ -1,8 +1,5 @@
-{ Build, Target, exe } = std.build
-build = (b: Build) Target {
-    target := exe("hello-mac").root("src").main("main.zen").out("hello-mac").sources(["native/appkit.m"])
-    b.target().os.match ({
-        .MacOS => target.frameworks(["AppKit", "Foundation"]).libraries(["objc"]),
-        _      => target,
-    })
+{ Build, Plan, Target, exe, plan } = std.build
+build = (b: Build) Plan {
+    target := exe("hello-mac").root("src").main("main.zen").out("hello-mac").target(b.target()).sources_on(.MacOS, ["native/appkit.m"]).frameworks_on(.MacOS, ["AppKit", "Foundation"]).libraries_on(.MacOS, ["objc"])
+    plan([target])
 }

@@ -25,12 +25,12 @@ Install Xcode command-line tools and make `zenc` available at `../zenc`, then:
 ./hello-mac
 ```
 
-The build uses Zen's first-class native-source, framework, library, and host-OS
-configuration:
+The build returns a target plan and attaches native requirements to macOS only:
 
 ```zen
 exe("hello-mac")
-    .sources(["native/appkit.m"])
-    .frameworks(["AppKit", "Foundation"])
-    .libraries(["objc"])
+    .target(b.target())
+    .sources_on(.MacOS, ["native/appkit.m"])
+    .frameworks_on(.MacOS, ["AppKit", "Foundation"])
+    .libraries_on(.MacOS, ["objc"])
 ```
