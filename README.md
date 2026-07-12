@@ -25,14 +25,12 @@ Install Xcode command-line tools and make `zenc` available at `../zenc`, then:
 ./hello-mac
 ```
 
-The current `std.build` has no first-class native-source or framework setters.
-For now `build.zen` passes `native/appkit.m` and the AppKit/Foundation frameworks
-through its raw link field. The intended builder API is eventually:
+The build uses Zen's first-class native-source, framework, library, and host-OS
+configuration:
 
 ```zen
 exe("hello-mac")
-    .source("native/appkit.m")
-    .framework("AppKit")
-    .framework("Foundation")
+    .sources(["native/appkit.m"])
+    .frameworks(["AppKit", "Foundation"])
+    .libraries(["objc"])
 ```
-

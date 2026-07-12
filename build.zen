@@ -1,5 +1,8 @@
-// Native macOS executable. The links string is temporarily also carrying the
-// Objective-C source path because std.build does not have `.source` or
-// `.framework` setters yet.
 { Build, Target, exe } = std.build
-build = (b: Build) Target { exe("hello-mac").root("src").main("main.zen").out("hello-mac").links("objc native/appkit.m -framework AppKit -framework Foundation") }
+build = (b: Build) Target {
+    target := exe("hello-mac").root("src").main("main.zen").out("hello-mac").sources(["native/appkit.m"])
+    b.os().match ({
+        .MacOS => target.frameworks(["AppKit", "Foundation"]).libraries(["objc"]),
+        _      => target,
+    })
+}
