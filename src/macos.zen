@@ -1,0 +1,29 @@
+{ Result, IoError } = std.core.result
+{ Allocator } = std.mem.alloc
+// Opaque C-callable boundary implemented by native/appkit.m.
+zen_macos_app_create = (name: string_view) RawPtr<u8>
+zen_macos_window_create = (app: RawPtr<u8>, title: string_view, width: i64, height: i64) RawPtr<u8>
+zen_macos_window_show = (window: RawPtr<u8>) void
+zen_macos_app_run = (app: RawPtr<u8>) i32
+zen_macos_app_destroy = (app: RawPtr<u8>) void
+MacApp*<A>: {
+    allocator: MutPtr<A>,
+    native: RawPtr<u8>,
+    window = (app: MacApp<A>, title: string_view, width: i64, height: i64) Result<MacWindow, IoError> {
+        handle := zen_macos_window_create(app.native, title, width, height)
+        (handle == null_ptr()).match ({ true => .Err(.NotFound), false => .Ok(MacWindow(native: handle)) })
+    }
+    run = (app: MacApp<A>) i32 { zen_macos_app_run(app.native) }
+    deinit = (app: MacApp<A>) void { zen_macos_app_destroy(app.native) }
+}
+MacWindow*: {
+    native: RawPtr<u8>,
+    show = (window: MacWindow) void { zen_macos_window_show(window.native) }
+}
+mac_app_init*<A: Allocator> = (allocator: MutPtr<A>, name: string_view) Result<MacApp<A>, IoError> {
+    handle := zen_macos_app_create(name)
+    (handle == null_ptr()).match ({ true => .Err(.NotFound), false => .Ok(MacApp<A>(
+        allocator: allocator,
+        native: handle,
+    )) })
+}
