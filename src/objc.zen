@@ -1,0 +1,39 @@
+// Names and strings use the caller's scratch allocator. Native objects retain
+// their Objective-C ownership; allocation/init returns an owned +1 object.
+Alloc, AllocError, Ptr = std.mem
+str, c_text = std.text
+Runtime, Message = macos.native
+
+selector* = (a: Alloc, name: str) Res<Ptr<()>, AllocError> {
+    bytes = name.c_text(a).try();
+    Ok(Runtime.sel_registerName(bytes.ptr().to<c_char>()))
+}
+class* = (a: Alloc, name: str) Res<Ptr<()>, AllocError> {
+    bytes = name.c_text(a).try();
+    Ok(Runtime.objc_getClass(bytes.ptr().to<c_char>()))
+}
+object* = (a: Alloc, receiver: Ptr<()>, name: str) Res<Ptr<()>, AllocError> {
+    Ok(Message.object(receiver, selector(a, name).try()))
+}
+create* = (a: Alloc, name: str) Res<Ptr<()>, AllocError> {
+    initialize = selector(a, "init").try();
+    allocated  = object(a, class(a, name).try(), "alloc").try();
+    Ok(Message.object(allocated, initialize))
+}
+release* = (a: Alloc, value: Ptr<()>) Res<(), AllocError> {
+    Message.void(value, selector(a, "release").try());
+    Ok(())
+}
+text* = (a: Alloc, value: str) Res<Ptr<()>, AllocError> {
+    initialize  = selector(a, "initWithBytes:length:encoding:").try();
+    autorelease = selector(a, "autorelease").try();
+    allocated   = object(a, class(a, "NSString").try(), "alloc").try();
+    result      = Message.bytes(
+        allocated,
+        initialize,
+        value.ptr(),
+        value.len,
+        4
+    );
+    Ok(Message.object(result, autorelease))
+}

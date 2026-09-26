@@ -1,0 +1,43 @@
+// Header-backed declarations. No handwritten Objective-C implementation.
+Ptr = std.mem
+
+Point* = { x*: f64, y*: f64 }
+Size* = { width*: f64, height*: f64 }
+Rect* = { origin*: Point, size*: Size }
+Color* = { red*: f64, green*: f64, blue*: f64, alpha*: f64 }
+
+Runtime* = c.bind("objc/runtime.h", {
+    objc_getClass* = (name: Ptr<c_char>) Ptr<()>
+    sel_registerName* = (name: Ptr<c_char>) Ptr<()>
+})
+
+// Each signature is the exact Objective-C method ABI at its call site.
+// Struct returns below target Apple silicon; x86 stret is not supported.
+Message* = c.bind("objc/message.h", "objc_msgSend", {
+    object* = (receiver: Ptr<()>, selector: Ptr<()>) Ptr<()>
+    object_arg* = (receiver: Ptr<()>, selector: Ptr<()>, value: Ptr<()>) Ptr<()>
+    integer_arg* = (receiver: Ptr<()>, selector: Ptr<()>, value: u64) Ptr<()>
+    date* = (receiver: Ptr<()>, selector: Ptr<()>, seconds: f64) Ptr<()>
+    bytes* = (receiver: Ptr<()>, selector: Ptr<()>, bytes: Ptr<u8>, count: usize, encoding: usize) Ptr<()>
+    window* = (receiver: Ptr<()>, selector: Ptr<()>, rect: Rect, style: u64, backing: u64, deferred: bool) Ptr<()>
+    event* = (receiver: Ptr<()>, selector: Ptr<()>, mask: u64, until: Ptr<()>, mode: Ptr<()>, dequeue: bool) Ptr<()>
+    void* = (receiver: Ptr<()>, selector: Ptr<()>) ()
+    set_object* = (receiver: Ptr<()>, selector: Ptr<()>, value: Ptr<()>) ()
+    set_bool* = (receiver: Ptr<()>, selector: Ptr<()>, value: bool) ()
+    set_integer* = (receiver: Ptr<()>, selector: Ptr<()>, value: u64) ()
+    set_float* = (receiver: Ptr<()>, selector: Ptr<()>, value: f64) ()
+    set_rect* = (receiver: Ptr<()>, selector: Ptr<()>, value: Rect) ()
+    set_size* = (receiver: Ptr<()>, selector: Ptr<()>, value: Size) ()
+    set_color* = (receiver: Ptr<()>, selector: Ptr<()>, value: Color) ()
+    boolean_integer* = (receiver: Ptr<()>, selector: Ptr<()>, value: u64) bool
+    boolean* = (receiver: Ptr<()>, selector: Ptr<()>) bool
+    count* = (receiver: Ptr<()>, selector: Ptr<()>, encoding: usize) usize
+    keycode* = (receiver: Ptr<()>, selector: Ptr<()>) u16
+    integer* = (receiver: Ptr<()>, selector: Ptr<()>) u64
+    scalar* = (receiver: Ptr<()>, selector: Ptr<()>) f64
+    rect* = (receiver: Ptr<()>, selector: Ptr<()>) Rect
+})
+
+Metal* = c.bind("Metal/Metal.h", {
+    MTLCreateSystemDefaultDevice* = () Ptr<()>
+})

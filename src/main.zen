@@ -1,14 +1,7 @@
-{ MacApp, mac_app_init } = macos
-{ Sys } = std.sys
-{ Heap } = std.mem.alloc
-{ Result, IoError } = std.core.result
-main = (sys: Sys) i32 {
-    heap := sys.heap()
-    created: Result<MacApp<Heap>, IoError> := mac_app_init(heap.addr(), "Hello from Zen")
-    app := created.expect("could not start AppKit")
-    window := app.window("Hello from Zen", 800, 500).expect("could not create window")
-    window.show()
-    code := app.run()
-    app.deinit()
-    code
+App, Config = macos
+
+main = (env: Env) Res<i32, AllocError> {
+    arena ::= env.mem.alloc();
+    app   ::= App.open(arena, "Zen GPU Console").try();
+    app.run(env)
 }

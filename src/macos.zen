@@ -1,29 +1,570 @@
-{ Result, IoError } = std.core.result
-{ Allocator } = std.mem.alloc
-// Opaque C-callable boundary implemented by native/appkit.m.
-zen_macos_app_create = (name: string_view) RawPtr<u8>
-zen_macos_window_create = (app: RawPtr<u8>, title: string_view, width: i64, height: i64) RawPtr<u8>
-zen_macos_window_show = (window: RawPtr<u8>) void
-zen_macos_app_run = (app: RawPtr<u8>) i32
-zen_macos_app_destroy = (app: RawPtr<u8>) void
-MacApp*<A>: {
-    allocator: MutPtr<A>,
-    native: RawPtr<u8>,
-    window = (app: MacApp<A>, title: string_view, width: i64, height: i64) Result<MacWindow, IoError> {
-        handle := zen_macos_window_create(app.native, title, width, height)
-        (handle == null_ptr()).match ({ true => .Err(.NotFound), false => .Ok(MacWindow(native: handle)) })
+// Zen owns the app lifecycle, input buffer, and frame scheduling. Native
+// declarations in native.zen lower to direct header-backed ABI calls.
+Alloc, AllocError, Ptr, null_ptr = std.mem
+str, String, str_at = std.text
+Range = std.core
+Message, Metal, Point, Size, Rect, Color = macos.native
+selector, class, object, create, text = macos.objc
+FrameRate = macos.display
+Capture, Recording, permission, permission_text = macos.audio
+
+BUFFER_CAPACITY*: usize = 4096
+
+frame = (width: f64, height: f64) Rect {
+    Rect(
+        origin: Point(x: 0.0, y: 0.0),
+        size: Size(width: width, height: height)
+    )
+}
+
+// Text is borrowed and must outlive the app and its run loop.
+Config* = {
+    title*: str,
+    heading*: str,
+    description*: str,
+    prompt*: str,
+    greeting*: str,
+}
+
+App* = {
+    config: Config,
+    application :: Ptr<()>,
+    window :: Ptr<()>,
+    view :: Ptr<()>,
+    layer :: Ptr<()>,
+    text_layer :: Ptr<()>,
+    status_layer :: Ptr<()>,
+    bars: Ptr<Ptr<()>>,
+    rate :: FrameRate,
+    levels: Ptr<f64>,
+    microphone*: Capture,
+    microphone_error :: i32,
+    notice :: str,
+    device :: Ptr<()>,
+    queue :: Ptr<()>,
+    speech :: Ptr<()>,
+    pool :: Ptr<()>,
+    release: Ptr<()>,
+    close_window: Ptr<()>,
+    stop_speech: Ptr<()>,
+    input: Ptr<u8>,
+    used :: usize,
+    frames* :: usize,
+
+    open* = (a: Alloc, title: str) Res<App, AllocError> {
+        App.configured(
+            a,
+            Config(
+                title: title,
+                heading: "ZEN / METAL",
+                description: "Native window · Zen input buffer · macOS speech\nType below. Enter speaks. Escape exits.",
+                prompt: "> ",
+                greeting: "Hello from Zen. Metal is rendering this window."
+            )
+        )
     }
-    run = (app: MacApp<A>) i32 { zen_macos_app_run(app.native) }
-    deinit = (app: MacApp<A>) void { zen_macos_app_destroy(app.native) }
-}
-MacWindow*: {
-    native: RawPtr<u8>,
-    show = (window: MacWindow) void { zen_macos_window_show(window.native) }
-}
-mac_app_init*<A: Allocator> = (allocator: MutPtr<A>, name: string_view) Result<MacApp<A>, IoError> {
-    handle := zen_macos_app_create(name)
-    (handle == null_ptr()).match ({ true => .Err(.NotFound), false => .Ok(MacApp<A>(
-        allocator: allocator,
-        native: handle,
-    )) })
+
+    configured* = (a: Alloc, config: Config) Res<App, AllocError> {
+        release      = selector(a, "release").try();
+        close_window = selector(a, "close").try();
+        stop_speech  = selector(a, "stopSpeakingAtBoundary:").try();
+        input        = a.realloc<u8>(null_ptr<u8>(), BUFFER_CAPACITY).try();
+        bars         = a.realloc<Ptr<()>>(null_ptr<Ptr<()>>(), 32).try();
+        levels       = a.realloc<f64>(null_ptr<f64>(), 32).try();
+        Range(0, 32).loop((i) { levels.write(i, 0.0); });
+        microphone = Capture.create(a).try();
+        app   ::= App(
+            config: config,
+            application: null_ptr<()>(),
+            window: null_ptr<()>(),
+            view: null_ptr<()>(),
+            layer: null_ptr<()>(),
+            text_layer: null_ptr<()>(),
+            status_layer: null_ptr<()>(),
+            bars: bars,
+            rate: FrameRate.create(),
+            levels: levels,
+            microphone: microphone,
+            microphone_error: 0,
+            notice: "",
+            device: null_ptr<()>(),
+            queue: null_ptr<()>(),
+            speech: null_ptr<()>(),
+            pool: null_ptr<()>(),
+            release: release,
+            close_window: close_window,
+            stop_speech: stop_speech,
+            input: input,
+            used: 0,
+            frames: 0
+        );
+        ready ::= false;
+        @scope.defer(() { (!ready).then(() { app.close(); }); });
+        pool            = create(a, "NSAutoreleasePool").try();
+        app.pool        = pool;
+        application     = object(
+            a,
+            class(a, "NSApplication").try(),
+            "sharedApplication"
+        ).try();
+        app.application = application;
+        Message.boolean_integer(
+            application,
+            selector(a, "setActivationPolicy:").try(),
+            0
+        );
+        initialize_window    = selector(
+            a,
+            "initWithContentRect:styleMask:backing:defer:"
+        ).try();
+        released_when_closed = selector(a, "setReleasedWhenClosed:").try();
+        allocated            = object(
+            a,
+            class(a, "NSWindow").try(),
+            "alloc"
+        ).try();
+        window               = Message.window(
+            allocated,
+            initialize_window,
+            frame(960.0, 600.0),
+            15,
+            2,
+            false
+        );
+        app.window           = window;
+        Message.set_bool(window, released_when_closed, false);
+        Message.set_size(
+            window,
+            selector(a, "setContentMinSize:").try(),
+            Size(width: 360.0, height: 240.0)
+        );
+        Message.set_object(
+            window,
+            selector(a, "setTitle:").try(),
+            text(a, config.title).try()
+        );
+        view       = object(a, window, "contentView").try();
+        app.view   = view;
+        device     = Metal.MTLCreateSystemDefaultDevice();
+        app.device = device;
+        queue      = object(a, device, "newCommandQueue").try();
+        app.queue  = queue;
+        layer      = object(a, class(a, "CAMetalLayer").try(), "layer").try();
+        app.layer  = layer;
+        Message.set_object(layer, selector(a, "setDevice:").try(), device);
+        Message.set_integer(layer, selector(a, "setPixelFormat:").try(), 80);
+        Message.set_bool(layer, selector(a, "setFramebufferOnly:").try(), true);
+        Message.set_bool(view, selector(a, "setWantsLayer:").try(), true);
+        Message.set_object(view, selector(a, "setLayer:").try(), layer);
+        text_layer     = object(
+            a,
+            class(a, "CATextLayer").try(),
+            "layer"
+        ).try();
+        app.text_layer = text_layer;
+        Message.set_object(
+            text_layer,
+            selector(a, "setFont:").try(),
+            text(a, "Menlo").try()
+        );
+        Message.set_float(text_layer, selector(a, "setFontSize:").try(), 18.0);
+        Message.set_bool(text_layer, selector(a, "setWrapped:").try(), true);
+        Message.set_object(
+            layer,
+            selector(a, "addSublayer:").try(),
+            text_layer
+        );
+        status_layer     = object(
+            a,
+            class(a, "CATextLayer").try(),
+            "layer"
+        ).try();
+        app.status_layer = status_layer;
+        Message.set_object(
+            status_layer,
+            selector(a, "setFont:").try(),
+            text(a, "Menlo").try()
+        );
+        Message.set_float(
+            status_layer,
+            selector(a, "setFontSize:").try(),
+            13.0
+        );
+        Message.set_object(
+            layer,
+            selector(a, "addSublayer:").try(),
+            status_layer
+        );
+        color = object(
+            a,
+            object(a, class(a, "NSColor").try(), "cyanColor").try(),
+            "CGColor"
+        ).try();
+        Range(0, 32).loop((i) {
+            bar = object(a, class(a, "CALayer").try(), "layer").try();
+            bars.write(i, bar);
+            Message.set_object(
+                bar,
+                selector(a, "setBackgroundColor:").try(),
+                color
+            );
+            Message.set_object(layer, selector(a, "addSublayer:").try(), bar);
+        });
+        speech     = create(a, "AVSpeechSynthesizer").try();
+        app.speech = speech;
+        app.refresh(a).try();
+        ready = true;
+        Ok(app)
+    }
+
+    close* = (self :: @Self) () {
+        self.microphone.stop();
+        // Stop speech before releasing its owner; the window owns its layers.
+        Message.boolean_integer(self.speech, self.stop_speech, 0);
+        Message.void(self.speech, self.release);
+        Message.void(self.window, self.close_window);
+        Message.void(self.window, self.release);
+        Message.void(self.queue, self.release);
+        Message.void(self.device, self.release);
+        Message.void(self.pool, self.release);
+        self.speech       = null_ptr<()>();
+        self.window       = null_ptr<()>();
+        self.queue        = null_ptr<()>();
+        self.device       = null_ptr<()>();
+        self.pool         = null_ptr<()>();
+        self.application  = null_ptr<()>();
+        self.view         = null_ptr<()>();
+        self.layer        = null_ptr<()>();
+        self.text_layer   = null_ptr<()>();
+        self.status_layer = null_ptr<()>();
+    }
+
+    refresh = (self: @Self, a: Alloc) Res<(), AllocError> {
+        transaction = class(a, "CATransaction").try();
+        commit      = selector(a, "commit").try();
+        Message.void(transaction, selector(a, "begin").try());
+        @scope.defer(() { Message.void(transaction, commit); });
+        Message.set_bool(
+            transaction,
+            selector(a, "setDisableActions:").try(),
+            true
+        );
+        contents = a.String(
+            "{}\n\n{}\n{}\n\n{}{}",
+            self.config.heading,
+            self.config.description,
+            self.notice,
+            self.config.prompt,
+            str_at(self.input, self.used)
+        ).try();
+        Message.set_object(
+            self.text_layer,
+            selector(a, "setString:").try(),
+            text(a, contents.view()).try()
+        );
+        status = a.String(
+            "FPS {} · mic {} · {} · code {} · F2 · FFT 0–8 kHz",
+            self.rate.value,
+            self.microphone.active().match({true => "ON", false => "off"}),
+            permission_text(permission(a).try()),
+            self.microphone_error
+        ).try();
+        Message.set_object(
+            self.status_layer,
+            selector(a, "setString:").try(),
+            text(a, status.view()).try()
+        );
+        Ok(())
+    }
+
+    speak = (self: @Self, a: Alloc) Res<(), AllocError> {
+        words     = str_at(self.input, self.used);
+        spoken    = words.is_empty().match({ true => self.config.greeting, false => words });
+        utterance = Message.object_arg(
+            class(a, "AVSpeechUtterance").try(),
+            selector(a, "speechUtteranceWithString:").try(),
+            text(a, spoken).try()
+        );
+        Message.boolean_integer(self.speech, self.stop_speech, 0);
+        Message.set_object(
+            self.speech,
+            selector(a, "speakUtterance:").try(),
+            utterance
+        );
+        Ok(())
+    }
+
+    key = (self :: @Self, a: Alloc, event: Ptr<()>) Res<bool, AllocError> {
+        key = Message.keycode(event, selector(a, "keyCode").try());
+        (key == 120).then(() {
+            self.microphone_error = self.microphone.active().match({
+                true  => self.microphone.stop(),
+                false => self.microphone.start(),
+            });
+            self.refresh(a).try();
+        });
+        (key == 53).match({
+            true  => Ok(false),
+            false => {
+                (key == 120).match({true => (), false => {
+                (key == 36).match({
+                    true  => self.speak(a).try(),
+                    false => (key == 51).match({
+                        true  => {
+                            (self.used > 0).then(() {
+                                self.used = self.used - 1;
+                                loop(self.used > 0 && self.input.read(self.used) >= 128 && self.input.read(self.used) < 192, (h) {
+                                    self.used = self.used - 1;
+                                });
+                            });
+                        },
+                        false => {
+                            chars = object(a, event, "characters").try();
+                            bytes = object(
+                                a,
+                                chars,
+                                "UTF8String"
+                            ).try().to<u8>();
+                            count = Message.count(
+                                chars,
+                                selector(
+                                    a,
+                                    "lengthOfBytesUsingEncoding:"
+                                ).try(),
+                                4
+                            );
+                            (!bytes.is_null() && count <= BUFFER_CAPACITY - self.used).then(() {
+                                self.input.offset(self.used).copy_from(bytes, count);
+                                self.used = self.used + count;
+                            });
+                        },
+                    }),
+                });
+                } });
+                self.refresh(a).try();
+                Ok(true)
+            },
+        })
+    }
+
+    draw = (self :: @Self, a: Alloc) Res<(), AllocError> {
+        bounds = Message.rect(self.view, selector(a, "bounds").try());
+        scale  = Message.scalar(
+            self.window,
+            selector(a, "backingScaleFactor").try()
+        );
+        Message.set_size(
+            self.layer,
+            selector(a, "setDrawableSize:").try(),
+            Size(
+                width: bounds.size.width * scale,
+                height: bounds.size.height * scale
+            )
+        );
+        Message.set_float(
+            self.text_layer,
+            selector(a, "setContentsScale:").try(),
+            scale
+        );
+        Message.set_rect(
+            self.text_layer,
+            selector(a, "setFrame:").try(),
+            Rect(
+                origin: Point(x: 24.0, y: 190.0),
+                size: Size(
+                    width: bounds.size.width - 48.0,
+                    height: bounds.size.height - 214.0
+                )
+            )
+        );
+        Message.set_float(
+            self.status_layer,
+            selector(a, "setContentsScale:").try(),
+            scale
+        );
+        Message.set_rect(
+            self.status_layer,
+            selector(a, "setFrame:").try(),
+            Rect(
+                origin: Point(x: 24.0, y: 24.0),
+                size: Size(width: bounds.size.width - 48.0, height: 24.0)
+            )
+        );
+        transaction = class(a, "CATransaction").try();
+        Message.void(transaction, selector(a, "begin").try());
+        Message.set_bool(
+            transaction,
+            selector(a, "setDisableActions:").try(),
+            true
+        );
+        Range(0, 32).loop((i) {
+            x     = i.to_u64().to_i32().ok_or(
+                AllocError.OutOfMemory
+            ).try().to_f64();
+            width = (bounds.size.width - 48.0) / 32.0;
+            Message.set_rect(
+                self.bars.read(i),
+                selector(a, "setFrame:").try(),
+                Rect(
+                    origin: Point(x: 24.0 + x * width, y: 60.0),
+                    size: Size(
+                        width: width - 3.0,
+                        height: 2.0 + self.levels.read(i) * 110.0
+                    )
+                )
+            );
+        });
+        Message.void(transaction, selector(a, "commit").try());
+        drawable = object(a, self.layer, "nextDrawable").try();
+        (!drawable.is_null()).then(() {
+            pass        = object(
+                a,
+                class(a, "MTLRenderPassDescriptor").try(),
+                "renderPassDescriptor"
+            ).try();
+            attachments = object(a, pass, "colorAttachments").try();
+            color       = Message.integer_arg(
+                attachments,
+                selector(a, "objectAtIndexedSubscript:").try(),
+                0
+            );
+            Message.set_object(
+                color,
+                selector(a, "setTexture:").try(),
+                object(a, drawable, "texture").try()
+            );
+            Message.set_integer(color, selector(a, "setLoadAction:").try(), 2);
+            Message.set_integer(color, selector(a, "setStoreAction:").try(), 1);
+            Message.set_color(
+                color,
+                selector(a, "setClearColor:").try(),
+                Color(red: 0.025, green: 0.035, blue: 0.055, alpha: 1.0)
+            );
+            command = object(a, self.queue, "commandBuffer").try();
+            encoder = Message.object_arg(
+                command,
+                selector(a, "renderCommandEncoderWithDescriptor:").try(),
+                pass
+            );
+            Message.void(encoder, selector(a, "endEncoding").try());
+            Message.set_object(
+                command,
+                selector(a, "presentDrawable:").try(),
+                drawable
+            );
+            Message.void(command, selector(a, "commit").try());
+            self.frames = self.frames + 1;
+            self.rate.submitted().then(() { self.refresh(a).try(); });
+        });
+        Ok(())
+    }
+
+    tick* = (self :: @Self, a: Alloc) Res<bool, AllocError> {
+        frame_pool = create(a, "NSAutoreleasePool").try();
+        @scope.defer(() { Message.void(frame_pool, self.release); });
+        until = Message.date(
+            class(a, "NSDate").try(),
+            selector(a, "dateWithTimeIntervalSinceNow:").try(),
+            0.016
+        );
+        event = Message.event(
+            self.application,
+            selector(
+                a,
+                "nextEventMatchingMask:untilDate:inMode:dequeue:"
+            ).try(),
+            u64.MAX,
+            until,
+            text(a, "kCFRunLoopDefaultMode").try(),
+            true
+        );
+        keep ::= true;
+        (!event.is_null()).then(() {
+            kind = Message.integer(event, selector(a, "type").try());
+            (kind == 10).match({
+                true  => { keep = self.key(a, event).try(); },
+                false => Message.set_object(
+                    self.application,
+                    selector(a, "sendEvent:").try(),
+                    event
+                ),
+            });
+        });
+        capture_error = self.microphone.poll();
+        (capture_error != 0).then(
+            () { self.microphone_error = capture_error; }
+        );
+        self.draw(a).try();
+        Ok(keep && Message.boolean(self.window, selector(a, "isVisible").try()))
+    }
+
+    // The caller keeps notice text alive until replaced or the app closes.
+    set_notice* = (self :: @Self, a: Alloc, value: str) Res<(), AllocError> {
+        self.notice = value;
+        self.refresh(a)
+    }
+
+    set_input* = (self :: @Self, a: Alloc, value: str) Res<bool, AllocError> {
+        (value.len <= BUFFER_CAPACITY).match({
+            true  => {
+                self.input.copy_from(value.ptr(), value.len);
+                self.used = value.len;
+                self.refresh(a).try();
+                Ok(true)
+            },
+            false => Ok(false),
+        })
+    }
+
+    // Host application owns DSP and model work between ticks.
+    spectrum* = (self: @Self, values: Ptr<f64>) () {
+        self.levels.copy_from(values, 32);
+    }
+
+    begin* = (self: @Self, a: Alloc) Res<bool, AllocError> {
+        (self.window.is_null() || self.device.is_null() || self.queue.is_null()).match({
+            true  => Ok(false),
+            false => {
+                Message.void(
+                    self.application,
+                    selector(a, "finishLaunching").try()
+                );
+                Message.void(self.window, selector(a, "center").try());
+                Message.set_object(
+                    self.window,
+                    selector(a, "makeKeyAndOrderFront:").try(),
+                    null_ptr<()>()
+                );
+                Message.set_bool(
+                    self.application,
+                    selector(a, "activateIgnoringOtherApps:").try(),
+                    true
+                );
+                Ok(true)
+            },
+        })
+    }
+
+    run* = (self :: @Self, env: Env) Res<i32, AllocError> {
+        @scope.defer(() { self.close(); });
+        (self.window.is_null() || self.device.is_null() || self.queue.is_null()).match({
+            true  => { println("zen-macos: window or Metal device unavailable"); Ok(1) },
+            false => {
+                setup ::= env.mem.alloc();
+                self.begin(setup).try();
+                smoke = env.argv.find(
+                    (arg) { arg.eq("--smoke") }
+                ).match({ Ok(_) => true, None => false });
+                running ::= true;
+                ticks   ::= 0;
+                loop(running && (!smoke || ticks < 30), (h) {
+                    scratch ::= env.mem.alloc();
+                    running = self.tick(scratch).try();
+                    ticks   = ticks + 1;
+                });
+                println("zen-macos: {} Metal frames", self.frames);
+                Ok((self.frames > 0).match({ true => 0, false => 1 }))
+            },
+        })
+    }
 }

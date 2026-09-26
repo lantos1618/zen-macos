@@ -1,19 +1,14 @@
 Builder, BuildError = std.build
-
 build = (b :: Builder) Res<(), BuildError> {
     macos = b.lib("macos", {
-        src: Path("src/macos.zen"),
-        libs: ["objc"],
-        paths: [],
+        src: Path("../../src/macos.zen"), libs: ["objc"], paths: [],
     }).try();
-    b.exe("zen-macos", {
-        src: Path("src/main.zen"),
-        deps: [macos],
-        language: "objective-c",
+    b.exe("ownership", {
+        src: Path("main.zen"), deps: [macos], language: "objective-c",
         frameworks: [
             "AppKit", "Foundation", "QuartzCore", "Metal", "AVFoundation", "AudioToolbox", "CoreFoundation"
         ],
-        out: Ok(Path("app/ZenConsole.app/Contents/MacOS/ZenConsole")),
+        out: Ok(Path("../../build/ownership")),
     }).try();
     Ok(())
 }

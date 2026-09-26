@@ -1,0 +1,304 @@
+// Mono microphone samples delivered on the caller's main CFRunLoop. No work
+// here runs on an audio worker: callbacks and reads share one thread.
+Alloc, AllocError, Ptr, null_ptr = std.mem
+callback = std.native
+
+str = std.text
+class, selector, text = macos.objc
+
+Permission* = NotDetermined | Restricted | Denied | Authorized | Unavailable
+
+Authorization = c.bind("objc/message.h", "objc_msgSend", {
+    status* = (receiver: Ptr<()>, selector: Ptr<()>, media: Ptr<()>) i64
+})
+
+// Read-only: checking status never presents a permission dialog.
+permission* = (a: Alloc) Res<Permission, AllocError> {
+    device = class(a, "AVCaptureDevice").try();
+    device.is_null().match({
+        true  => Ok(Permission.Unavailable),
+        false => {
+            value = Authorization.status(
+                device,
+                selector(a, "authorizationStatusForMediaType:").try(),
+                text(a, "soun").try()
+            );
+            Ok(value.match({
+                0 => Permission.NotDetermined,
+                1 => Permission.Restricted,
+                2 => Permission.Denied,
+                3 => Permission.Authorized,
+                _ => Permission.Unavailable,
+            }))
+        },
+    })
+}
+
+permission_text* = (value: Permission) str {
+    value.match({
+        NotDetermined => "Permission pending — press F2 and allow microphone access",
+        Restricted    => "Microphone restricted by system policy",
+        Denied        => "Microphone denied — enable in System Settings > Privacy & Security > Microphone",
+        Authorized    => "Microphone authorized",
+        Unavailable   => "Microphone authorization unavailable",
+    })
+}
+
+SAMPLE_COUNT*: usize = 1024
+SAMPLE_RATE*: f64 = 16000.0
+RECORDING_CAPACITY*: usize = 480000
+
+// Borrowed samples remain valid until the allocator dies. Starting capture
+// again overwrites this recording; copy or consume it before restarting.
+Recording* = { data*: Ptr<f32>, count*: usize, rate*: u32 }
+
+// CoreAudio's AudioStreamBasicDescription ABI on Apple silicon.
+Format = {
+    rate: f64,
+    format: u32,
+    flags: u32,
+    bytes_per_packet: u32,
+    frames_per_packet: u32,
+    bytes_per_frame: u32,
+    channels: u32,
+    bits: u32,
+    reserved: u32,
+}
+
+// Prefix of AudioQueueBuffer; only these fields are inspected.
+Buffer = { capacity: u32, data: Ptr<f32>, size: u32 }
+
+RunLoop = c.bind("CoreFoundation/CoreFoundation.h", {
+    CFRunLoopGetCurrent* = () Ptr<()>
+})
+NewInput = c.bind("AudioToolbox/AudioToolbox.h", "AudioQueueNewInput", {
+    create* = (format: Ptr<Format>, callback: Ptr<()>, user: Ptr<()>, loop: Ptr<()>, mode: Ptr<()>, flags: u32, output: Ptr<Ptr<()>>) i32
+})
+AllocateBuffer = c.bind("AudioToolbox/AudioToolbox.h", "AudioQueueAllocateBuffer", {
+    allocate* = (queue: Ptr<()>, size: u32, output: Ptr<Ptr<()>>) i32
+})
+Queue = c.bind("AudioToolbox/AudioToolbox.h", {
+    AudioQueueEnqueueBuffer* = (queue: Ptr<()>, buffer: Ptr<()>, packets: u32, descriptions: Ptr<()>) i32
+    AudioQueueStart* = (queue: Ptr<()>, time: Ptr<()>) i32
+    AudioQueueStop* = (queue: Ptr<()>, immediate: bool) i32
+    AudioQueueDispose* = (queue: Ptr<()>, immediate: bool) i32
+})
+
+State = {
+    data: Ptr<f64>,
+    recording: Ptr<f32>,
+    recorded :: usize,
+    generation :: usize,
+    next :: usize,
+    count :: usize,
+    error :: i32,
+    running :: bool,
+}
+
+input_callback = (
+    user         : Ptr<()>,
+    queue        : Ptr<()>,
+    incoming     : Ptr<()>,
+    timestamp    : Ptr<()>,
+    packets      : u32,
+    descriptions : Ptr<()>
+) () {
+    state_ptr = user.to<State>();
+    state ::= state_ptr.read(0);
+    state.running.then(() {
+        buffer = incoming.to<Buffer>().read(0);
+        bytes  = (buffer.size <= buffer.capacity).match({true => buffer.size, false => buffer.capacity});
+        count  = bytes.to_usize() / 4;
+        Range(0, count).loop((i) {
+            sample = buffer.data.read(i);
+            state.data.write(state.next, sample.to_f64());
+            (state.recorded < RECORDING_CAPACITY).then(() {
+                state.recording.write(state.recorded, sample);
+                state.recorded = state.recorded + 1;
+            });
+            state.next = (state.next + 1) % SAMPLE_COUNT;
+            (state.count < SAMPLE_COUNT).then(
+                () { state.count = state.count + 1; }
+            );
+        });
+        state.error = Queue.AudioQueueEnqueueBuffer(
+            queue,
+            incoming,
+            0,
+            null_ptr<()>()
+        );
+        state_ptr.write(0, state);
+    });
+}
+
+// The allocator owns all state and must outlive stop(). All methods must be
+// called on the same main thread as create/start. Do not copy a live Capture.
+Capture* = {
+    state: Ptr<State>,
+    format: Ptr<Format>,
+    queue: Ptr<Ptr<()>>,
+    buffer: Ptr<Ptr<()>>,
+
+    create* = (a: Alloc) Res<Capture, AllocError> {
+        data      = a.realloc<f64>(null_ptr<f64>(), SAMPLE_COUNT).try();
+        recording = a.realloc<f32>(null_ptr<f32>(), RECORDING_CAPACITY).try();
+        state     = a.realloc<State>(null_ptr<State>(), 1).try();
+        format    = a.realloc<Format>(null_ptr<Format>(), 1).try();
+        queue     = a.realloc<Ptr<()>>(null_ptr<Ptr<()>>(), 1).try();
+        buffer    = a.realloc<Ptr<()>>(null_ptr<Ptr<()>>(), 1).try();
+        state.write(
+            0,
+            State(
+                data: data,
+                recording: recording,
+                recorded: 0,
+                generation: 0,
+                next: 0,
+                count: 0,
+                error: 0,
+                running: false
+            )
+        );
+        format.write(
+            0,
+            Format(
+                rate: SAMPLE_RATE,
+                format: 1819304813,
+                flags: 9,
+                bytes_per_packet: 4,
+                frames_per_packet: 1,
+                bytes_per_frame: 4,
+                channels: 1,
+                bits: 32,
+                reserved: 0
+            )
+        );
+        queue.write(0, null_ptr<()>());
+        buffer.write(0, null_ptr<()>());
+        Ok(Capture(state: state, format: format, queue: queue, buffer: buffer))
+    }
+
+    // Call only after an explicit microphone action. macOS controls the access
+    // prompt; the app bundle must supply NSMicrophoneUsageDescription.
+    start* = (self: @Self) i32 {
+        self.queue.read(0).is_null().match({
+            false => self.status(),
+            true  => {
+                state ::= self.state.read(0);
+                state.recorded = 0;
+                state.next     = 0;
+                state.count    = 0;
+                state.error    = 0;
+                state.running  = false;
+                self.state.write(0, state);
+                status ::= NewInput.create(
+                    self.format,
+                    callback(input_callback),
+                    self.state.to<()>(),
+                    RunLoop.CFRunLoopGetCurrent(),
+                    null_ptr<()>(),
+                    0,
+                    self.queue
+                );
+                (status == 0).then(() {
+                    queue = self.queue.read(0);
+                    Range(0, 3).loop((i) {
+                        (status == 0).then(() {
+                            status = AllocateBuffer.allocate(
+                                queue,
+                                1024,
+                                self.buffer
+                            );
+                            (status == 0).then(() {
+                                status = Queue.AudioQueueEnqueueBuffer(
+                                    queue,
+                                    self.buffer.read(0),
+                                    0,
+                                    null_ptr<()>()
+                                );
+                            });
+                        });
+                    });
+                    (status == 0).then(() {
+                        state.running = true;
+                        self.state.write(0, state);
+                        status = Queue.AudioQueueStart(queue, null_ptr<()>());
+                    });
+                });
+                (status != 0).then(() {
+                    self.stop();
+                    failed ::= self.state.read(0);
+                    failed.error = status;
+                    self.state.write(0, failed);
+                });
+                status
+            },
+        })
+    }
+
+    stop* = (self: @Self) i32 {
+        state ::= self.state.read(0);
+        state.running.then(() { state.generation = state.generation + 1; });
+        state.running = false;
+        self.state.write(0, state);
+        queue = self.queue.read(0);
+        queue.is_null().match({
+            true  => 0,
+            false => {
+                stopped  = Queue.AudioQueueStop(queue, true);
+                disposed = Queue.AudioQueueDispose(queue, true);
+                (disposed == 0).match({
+                    true  => self.queue.write(0, null_ptr<()>()),
+                    false => {
+                        failed ::= self.state.read(0);
+                        failed.error = disposed;
+                        self.state.write(0, failed);
+                    },
+                });
+                (disposed == 0).match({true => stopped, false => disposed})
+            },
+        })
+    }
+
+    // Call each UI frame. Disposal stays outside the audio callback, and the
+    // generation counter advances so the completed recording can be consumed.
+    poll* = (self: @Self) i32 {
+        state = self.state.read(0);
+        (state.running && (state.recorded >= RECORDING_CAPACITY || state.error != 0)).match({
+            true  => {
+                stopped = self.stop();
+                (state.error != 0).match({true => state.error, false => stopped})
+            },
+            false => state.error,
+        })
+    }
+
+    // A failed dispose keeps the queue reference: callers must not release the
+    // backing allocator until a subsequent stop succeeds or the process exits.
+    closed* = (self: @Self) bool { self.queue.read(0).is_null() }
+
+    recording* = (self: @Self) Recording {
+        state = self.state.read(0);
+        Recording(data: state.recording, count: state.recorded, rate: 16000)
+    }
+
+    generation* = (self: @Self) usize { self.state.read(0).generation }
+
+    active* = (self: @Self) bool { self.state.read(0).running }
+    status* = (self: @Self) i32 { self.state.read(0).error }
+
+    // Destination must hold 1024 f64 samples. Leading silence pads startup.
+    samples* = (self: @Self, destination: Ptr<f64>) usize {
+        state   = self.state.read(0);
+        padding = SAMPLE_COUNT - state.count;
+        Range(0, padding).loop((i) { destination.write(i, 0.0); });
+        first = (state.next + SAMPLE_COUNT - state.count) % SAMPLE_COUNT;
+        Range(0, state.count).loop((i) {
+            destination.write(
+                padding + i,
+                state.data.read((first + i) % SAMPLE_COUNT)
+            );
+        });
+        state.count
+    }
+}

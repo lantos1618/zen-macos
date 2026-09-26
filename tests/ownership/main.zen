@@ -1,0 +1,70 @@
+App, Config = macos
+
+FailAfter = {
+    base: Alloc,
+    left: Ptr<usize>,
+
+    take = (self: @Self) bool {
+        n = self.left.read(0);
+        (n == 0).match({
+            true  => false,
+            false => {
+                self.left.write(0, n - 1);
+                true
+            },
+        })
+    }
+}
+
+FailAfter.impl(Alloc, {
+    raw = (self: @Self, size: usize, align: usize)
+          Res<Ptr<u8>, AllocError> {
+        self.take().match({
+            true  => self.base.raw(size, align),
+            false => Err(AllocError.OutOfMemory),
+        })
+    }
+
+    realloc = <T>(self: @Self, p: Ptr<T>, count: usize)
+                Res<Ptr<T>, AllocError> {
+        self.take().match({
+            true  => self.base.realloc(p, count),
+            false => Err(AllocError.OutOfMemory),
+        })
+    }
+})
+
+main = (env: Env) Res<i32, AllocError> {
+    failures  ::= 0;
+    completed ::= 0;
+    Range(0, 512).loop((budget) {
+        arena ::= env.mem.alloc();
+        left  ::= arena.Vec<usize>();
+        left.add(budget).try();
+        failing = FailAfter(base: arena, left: left.ptr());
+        App.configured(
+            failing,
+            Config(
+                title: "Ownership check",
+                heading: "Test",
+                description: "Allocation failure sweep",
+                prompt: "> ",
+                greeting: "Test"
+            )
+        ).match({
+            Ok(value) => {
+                app ::= value;
+                app.close();
+                app.close();
+                completed = completed + 1;
+            },
+            Err(_)    => { failures = failures + 1; },
+        });
+    });
+    println(
+        "allocation failures {} successful double closes {}",
+        failures,
+        completed
+    );
+    Ok((failures > 0 && completed > 0).match({true => 0, false => 1}))
+}

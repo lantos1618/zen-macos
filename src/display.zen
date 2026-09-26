@@ -1,0 +1,33 @@
+// Frame submission rate measured against Core Animation's monotonic clock.
+Clock = c.bind("QuartzCore/QuartzCore.h", {
+    CACurrentMediaTime* = () f64
+})
+
+Math = c.bind("math.h", { round* = (value: f64) f64 })
+
+FrameRate* = {
+    start :: f64,
+    count :: i32,
+    value* :: f64,
+
+    create* = () FrameRate {
+        FrameRate(start: Clock.CACurrentMediaTime(), count: 0, value: 0.0)
+    }
+
+    submitted* = (self :: @Self) bool {
+        self.count = self.count + 1;
+        now        = Clock.CACurrentMediaTime();
+        elapsed    = now - self.start;
+        (elapsed >= 0.5).match({
+            true  => {
+                self.value = Math.round(
+                    self.count.to_f64() / elapsed * 10.0
+                ) / 10.0;
+                self.count = 0;
+                self.start = now;
+                true
+            },
+            false => false,
+        })
+    }
+}

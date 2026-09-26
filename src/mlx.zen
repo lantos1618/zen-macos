@@ -1,0 +1,9 @@
+// Optional MLX C binding. Import only in a target that supplies mlx-c headers
+// and links its library. Metal renders the UI; MLX owns tensor computation.
+Ptr = std.mem
+
+MetalBackend* = c.bind("mlx/c/metal.h", {
+    mlx_metal_is_available* = (available: Ptr<bool>) c_int
+    mlx_metal_start_capture* = (path: Ptr<c_char>) c_int
+    mlx_metal_stop_capture* = () c_int
+})
