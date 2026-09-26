@@ -3,7 +3,7 @@ Clock = c.bind("QuartzCore/QuartzCore.h", {
     CACurrentMediaTime* = () f64
 })
 
-Math = c.bind("math.h", { round* = (value: f64) f64 })
+round = std.math
 
 FrameRate* = {
     start :: f64,
@@ -20,9 +20,7 @@ FrameRate* = {
         elapsed    = now - self.start;
         (elapsed >= 0.5).match({
             true  => {
-                self.value = Math.round(
-                    self.count.to_f64() / elapsed * 10.0
-                ) / 10.0;
+                self.value = round(self.count.to_f64() / elapsed * 10.0) / 10.0;
                 self.count = 0;
                 self.start = now;
                 true
