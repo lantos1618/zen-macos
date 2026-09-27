@@ -172,3 +172,26 @@ Validation: actual F2 microphone start/FFT activity/stop passed in the app;
 fresh-denial permission UI was not exercised. Updated allocation sweep passed
 215 failure cases and 297 successful repeated closes. This is not a native heap
 leak audit; CoreAnalytics emitted two context-leak diagnostics during the sweep.
+
+For live transcription, `recording()` also works while capture is active: each
+call returns the current bounded prefix and sample count. Copy or serialize
+that prefix on the main thread before giving it to a worker; do not share the
+borrowed sample pointer with a background actor. `session()` starts at zero
+and changes whenever a new start attempt clears the recording, including a
+failed attempt. Tag worker requests and replies with it to discard replies
+from earlier captures. `generation()` still advances on stop and can trigger
+a final transcription. Repeated `start()` while active keeps the same session;
+repeated `stop()` keeps both counters unchanged.
+
+Zen actors currently use one pthread per actor with a bounded 64-message
+mailbox, mutex, and condition variable. They do not run on AppKit's main run
+loop or automatically marshal work back to it. AudioQueue callbacks are
+explicitly scheduled on the main CFRunLoop; native UI updates and capture
+views stay there. A worker should return copied data/results for the UI to
+consume on a later frame.
+
+`macos.display.monotonic()` returns Core Animation monotonic seconds. Use
+elapsed differences to drive smoothing so animation does not depend on frame
+rate. `Config.spectrum_label` defaults to `"FFT"`; applications can supply a
+label describing their displayed frequency range. Like the other config text,
+this string is borrowed and must remain valid throughout the app's run loop.

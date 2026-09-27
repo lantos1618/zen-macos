@@ -24,6 +24,7 @@ Config* = {
     description*: str,
     prompt*: str,
     greeting*: str,
+    spectrum_label* :: str = "FFT",
 }
 
 App* = {
@@ -263,11 +264,12 @@ App* = {
             text(a, contents.view()).try()
         );
         status = a.String(
-            "FPS {} · mic {} · {} · code {} · F2 · FFT 0–8 kHz",
+            "FPS {} · mic {} · {} · code {} · F2 · {}",
             self.rate.value,
             self.microphone.active().match({true => "ON", false => "off"}),
             permission_text(permission(a).try()),
-            self.microphone_error
+            self.microphone_error,
+            self.config.spectrum_label
         ).try();
         Message.set_object(
             self.status_layer,

@@ -3,6 +3,9 @@ Clock = c.bind("QuartzCore/QuartzCore.h", {
     CACurrentMediaTime* = () f64
 })
 
+// Seconds from Core Animation's monotonic clock, for elapsed-time updates.
+monotonic* = () f64 { Clock.CACurrentMediaTime() }
+
 round = std.math
 
 FrameRate* = {

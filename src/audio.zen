@@ -48,8 +48,11 @@ SAMPLE_COUNT*: usize = 1024
 SAMPLE_RATE*: f64 = 16000.0
 RECORDING_CAPACITY*: usize = 480000
 
-// Borrowed samples remain valid until the allocator dies. Starting capture
-// again overwrites this recording; copy or consume it before restarting.
+// A bounded view of the captured prefix, available during capture or after
+// stop. On the main thread, existing prefix samples stay unchanged until the
+// next start attempt; newly received audio extends the count of a later view.
+// Copy or serialize on the main thread before sending work to another thread.
+// The allocator must outlive every view.
 Recording* = { data*: Ptr<f32>, count*: usize, rate*: u32 }
 
 // CoreAudio's AudioStreamBasicDescription ABI on Apple silicon.
@@ -89,6 +92,7 @@ State = {
     recording: Ptr<f32>,
     recorded :: usize,
     generation :: usize,
+    session :: usize,
     next :: usize,
     count :: usize,
     error :: i32,
@@ -153,6 +157,7 @@ Capture* = {
                 recording: recording,
                 recorded: 0,
                 generation: 0,
+                session: 0,
                 next: 0,
                 count: 0,
                 error: 0,
@@ -185,6 +190,7 @@ Capture* = {
             false => self.status(),
             true  => {
                 state ::= self.state.read(0);
+                state.session  = state.session + 1;
                 state.recorded = 0;
                 state.next     = 0;
                 state.count    = 0;
@@ -281,6 +287,11 @@ Capture* = {
         state = self.state.read(0);
         Recording(data: state.recording, count: state.recorded, rate: 16000)
     }
+
+    // Changes when a new start attempt resets the captured prefix, including
+    // a failed attempt. An idempotent start while already active keeps its ID.
+    // Tag transcription jobs with this value and discard older-session replies.
+    session* = (self: @Self) usize { self.state.read(0).session }
 
     generation* = (self: @Self) usize { self.state.read(0).generation }
 

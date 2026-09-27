@@ -11,8 +11,9 @@ main = (env: Env) Res<i32, AllocError> {
     Range(0, SAMPLE_COUNT).loop((i) { valid = valid && samples.read(i) == 0.0; });
     recording = capture.recording();
     valid     = valid && recording.count == 0 && recording.rate == 16000;
-    valid     = valid && capture.generation() == 0;
+    valid     = valid && capture.generation() == 0 && capture.session() == 0;
     valid     = valid && capture.stop() == 0 && capture.stop() == 0;
-    println("empty samples and repeatable stop {}", valid);
+    valid     = valid && capture.session() == 0 && capture.recording().count == 0;
+    println("empty samples, stable session and repeatable stop {}", valid);
     Ok(valid.match({ true => 0, false => 1 }))
 }
