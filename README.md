@@ -2,8 +2,7 @@
 
 A native Apple-silicon macOS app written in current Zen. It opens a resizable,
 Retina-aware Metal window, keeps a bounded UTF-8 input buffer in Zen, and speaks
-entered text using AVFoundation. There is no handwritten C or Objective-C
-implementation: `native/appkit.m` has been removed.
+entered text using AVFoundation. Native bindings, callbacks, and application logic are implemented in Zen.
 
 ## Build and run
 
@@ -33,8 +32,8 @@ a restricted sandbox may prevent WindowServer/Metal access.
 
 ## Use the SDK from an app
 
-`zen-tui` is a separate application that depends on this SDK. Its app entry
-contains its own copy and configuration, while window, input, GPU presentation,
+[Zen Code](https://github.com/lantos1618/zen-tui) is an application that depends
+on this SDK. Its app entry owns application text and configuration, while window, input, GPU presentation,
 and speech implementation stay here. Register `../zen-macos/src/macos.zen` as
 `b.lib("macos", { src: ..., libs: ["objc"], paths: [] })` in the app's build graph,
 then list that library in the executable's dependencies. The executable uses
@@ -171,11 +170,6 @@ inference belongs to `zen-parakeet`; neither is a dependency of this SDK.
 `zen-tui` composes them. Capture callbacks do no allocation and execute on the
 same main CFRunLoop as snapshot reads.
 
-Validation: actual F2 microphone start/FFT activity/stop passed in the app;
-fresh-denial permission UI was not exercised. Updated allocation sweep passed
-215 failure cases and 297 successful repeated closes. This is not a native heap
-leak audit; CoreAnalytics emitted two context-leak diagnostics during the sweep.
-
 For live transcription, `recording()` also works while capture is active: each
 call returns the current bounded prefix and sample count. Copy or serialize
 that prefix on the main thread before giving it to a worker; do not share the
@@ -193,9 +187,9 @@ explicitly scheduled on the main CFRunLoop; native UI updates and capture
 views stay there. A worker should return copied data/results for the UI to
 consume on a later frame.
 
-`macos.display.monotonic()` returns Core Animation monotonic seconds. Use
-elapsed differences to drive smoothing so animation does not depend on frame
-rate. `Config.spectrum_label` defaults to `"FFT"`; applications can supply a
+Use `env.clock.since_start()` for application elapsed time and smoothing.
+`macos.display.monotonic()` returns Core Animation monotonic seconds for native
+display timing; do not mix timestamp domains. `Config.spectrum_label` defaults to `"FFT"`; applications can supply a
 label describing their displayed frequency range. Like the other config text,
 this string is borrowed and must remain valid throughout the app's run loop.
 
@@ -236,7 +230,7 @@ and the unchanged bounded default.
 `Config.input_tail_bytes` controls how much recent input is displayed. Its
 zero default displays all text. A positive limit shows the last bytes, advances
 the boundary to a UTF-8 codepoint, and prefixes an ellipsis when text is omitted;
-the full input buffer remains available. Zen TUI uses 600 bytes to keep recent
+the full input buffer remains available. Zen Code uses 600 bytes to keep recent
 dictation visible in the default 960×600 window. Smaller windows can still clip
 text; this is a display limit, not scrolling or text truncation in storage.
 
@@ -289,31 +283,7 @@ last 240 intervals. Each test window has a fifteen-second bound per window. An o
 be throttled by macOS; run this test in a visible desktop session. The SDK smoke
 requires 30 submitted frames within 30 seconds.
 
-Allocation-failure cleanup is explicit: construction initializes a borrowed App
-and closes its current handles on error. It does not defer a stale by-value
-snapshot of a partially initialized App. The updated allocation-budget sweep
-passed 241 failure paths and 271 successful double closes.
-
-Observed on Apple M2 Pro/macOS 26.6.2: three 120-frame lifecycle runs passed,
-with 120 updates per run and no coalescing; link-free seven-tick fallback took
-0.101134 s. The allocation sweep also passed. These validate callback delivery
-and teardown, not a sustained 60 FPS guarantee.
-
-Longer desktop diagnostics were mixed. Two 360-frame windows ended at 60
-submission FPS with rolling p95 17.05/17.10 ms and p99 32.96/32.84 ms. A third
-window hit the 15-second bound at 349 frames, with updates slowing and a roughly
-one-second p99. A separate `--steady` run also failed its bound (164 frames,
-171 updates, seven coalesced updates; p95 1016.57 ms). That run's independent
-fallback still passed at 0.101112 s. The source of this scheduling slowdown is
-unclassified: visibility, display power state and scheduling need correlation
-before attributing it to macOS throttling or application work. No microphone or
-model inference ran in these SDK diagnostics. Both failures are retained here;
-this change does not claim stable 60 FPS during transcription.
-
-A subsequent bounded Metal trace correlated its slowdown with the process
-transitioning to background at 2.839 seconds: submissions then fell to roughly
-three per second while GPU clear durations stayed around 20 microseconds.
-This supports background throttling for that traced run, not an inference or
-FFT bottleneck. It does not classify every earlier failure or measure the full
-Core Animation compositor. Keep the window foreground when measuring active
-pacing; lowering background presentation frequency is not itself a defect.
+Construction cleans up its current native handles on allocation failure. The
+ownership regression checks allocation failures and repeated closes; it is not
+a native heap leak audit. See [desktop validation](docs/PERFORMANCE.md) for
+measured lifecycle, pacing and trace results, including unresolved limitations.
