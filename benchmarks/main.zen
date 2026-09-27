@@ -1,0 +1,36 @@
+// Appended to production audio.zen by run.py; only the callback's pure state
+// kernel is invoked. No microphone queue, permission request, or window.
+BenchClock = c.bind("QuartzCore/QuartzCore.h", { CACurrentMediaTime* = () f64 })
+
+main = (env: Env) Res<i32, AllocError> {
+    arena ::= env.mem.alloc();
+    capture = Capture.create(arena).try();
+    input   = arena.realloc<f32>(null_ptr<f32>(), 256).try();
+    Range(0, 256).loop((i) { input.write(i, 0.1); });
+    valid ::= capture.continuous(true);
+    state ::= capture.state.read(0);
+    // Retain a ten-second context. Each iteration appends one16ms callback
+    // buffer then consumes256samples; the forward shift is intentionally timed.
+    Range(0, 160000).loop((i) { state.recording.write(i, 0.1); });
+    state.recorded = 160000;
+    capture.state.write(0, state);
+    checksum: f64 ::= 0.0;
+    Range(0, 32).loop((batch) {
+        start = BenchClock.CACurrentMediaTime();
+        Range(0, 1000).loop((iteration) {
+            current ::= capture.state.read(0);
+            current.append(input, 256);
+            capture.state.write(0, current);
+            valid    = capture.discard_prefix(256) && valid;
+            checksum = checksum + capture.recording().data.read(
+                iteration % 160000
+            ).to_f64();
+        });
+        elapsed = BenchClock.CACurrentMediaTime() - start;
+        (batch > 0).then(() { println("batch_us {}", elapsed * 1000.0); });
+    });
+    valid = valid && capture.status() == 0 && capture.recording().count == 160000;
+    println("checksum {}", checksum);
+    println("valid {}", valid);
+    Ok((valid && checksum > 0.0).match({true => 0, false => 1}))
+}

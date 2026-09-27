@@ -236,3 +236,15 @@ the boundary to a UTF-8 codepoint, and prefixes an ellipsis when text is omitted
 the full input buffer remains available. Zen TUI uses 600 bytes to keep recent
 dictation visible in the default 960×600 window. Smaller windows can still clip
 text; this is a display limit, not scrolling or text truncation in storage.
+
+### Bundle resources
+
+`resource_directory(a)` from `macos.bundle` returns an optional owned String
+with the main bundle's resource directory. It copies Foundation's UTF-8 path
+before draining its local autorelease pool, and works from the bundled
+executable regardless of the shell working directory. Applications own the
+configuration format and filesystem policy; this helper does not load a model
+or write settings. Zen Code uses it for development-bundle model configuration.
+
+Reproducible capture-buffer measurements are in [benchmarks](benchmarks/README.md)
+and [measured results](benchmarks/RESULTS.md); they do not activate a microphone.

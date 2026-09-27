@@ -1,0 +1,25 @@
+// Foundation bundle paths copied into caller-owned Zen memory.
+Ptr = std.mem
+String, str_at = std.text
+class, object, create, release = macos.objc
+
+resource_directory* = (a: Alloc) Res<Res<String>, AllocError> {
+    pool = create(a, "NSAutoreleasePool").try();
+    @scope.defer(() { release(a, pool); });
+    bundle = object(a, class(a, "NSBundle").try(), "mainBundle").try();
+    path   = object(a, bundle, "resourcePath").try();
+    path.is_null().match({
+        true  => Ok(None),
+        false => {
+            bytes = object(a, path, "UTF8String").try().to<u8>();
+            bytes.is_null().match({
+                true  => Ok(None),
+                false => {
+                    count ::= 0;
+                    loop(bytes.read(count) != 0, (h) { count = count + 1; });
+                    Ok(Ok(a.String("{}", str_at(bytes, count)).try()))
+                },
+            })
+        },
+    })
+}
