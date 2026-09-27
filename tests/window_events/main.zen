@@ -1,0 +1,54 @@
+CloseRequests = macos.window_events
+Runtime, Message, Rect, Point, Size = macos.native
+class, selector, object, create = macos.objc
+Call = c.bind("objc/message.h", "objc_msgSend", {
+    close* = (receiver: Ptr<()>, method: Ptr<()>, window: Ptr<()>) bool
+})
+main = (env: Env) Res<i32, AllocError> {
+    a           = env.mem.alloc();
+    pool        = create(a, "NSAutoreleasePool").try();
+    release     = selector(a, "release").try();
+    application = object(
+        a,
+        class(a, "NSApplication").try(),
+        "sharedApplication"
+    ).try();
+    window      = Message.window(
+        object(a, class(a, "NSWindow").try(), "alloc").try(),
+        selector(a, "initWithContentRect:styleMask:backing:defer:").try(),
+        Rect(
+            origin: Point(x: 0.0, y: 0.0),
+            size: Size(width: 100.0, height: 100.0)
+        ),
+        3,
+        2,
+        false
+    );
+    Message.set_bool(
+        window,
+        selector(a, "setReleasedWhenClosed:").try(),
+        false
+    );
+    requests ::= CloseRequests.create(a, window).try();
+    good     ::= !requests.take();
+    delegate = object(a, window, "delegate").try();
+    method   = selector(a, "windowShouldClose:").try();
+    good     = good && !delegate.is_null() && !Call.close(
+        delegate,
+        method,
+        window
+    );
+    good     = good && requests.take() && !requests.take();
+    good     = good && !Call.close(delegate, method, window) && !Call.close(delegate, method, window);
+    good     = good && requests.take() && !requests.take();
+    requests.close(); requests.close();
+    good = good && object(
+        a,
+        window,
+        "delegate"
+    ).try().is_null() && !requests.take();
+    Message.void(window, selector(a, "close").try());
+    Message.void(window, release); Message.void(pool, release);
+    println("window close interception and repeated cleanup: {}", good);
+    Ok(good.match({true => 0, false => 1}))
+}

@@ -1,0 +1,92 @@
+// Main-run-loop close interception. The native delegate sees a stable flag,
+// never an App address. Owner must close this before releasing its window or
+// allocator. Returning false lets the application decide how to handle edits.
+Ptr, null_ptr = std.mem
+c_text = std.text
+callback = std.native
+Runtime, Message = macos.native
+selector, class = macos.objc
+
+should_close = (receiver: Ptr<()>, method: Ptr<()>, window: Ptr<()>) bool {
+    state = Runtime.objc_getAssociatedObject(receiver, receiver).to<bool>();
+    (!state.is_null()).then(() { state.write(0, true); });
+    false
+}
+
+CloseRequests* = {
+    window :: Ptr<()>, delegate :: Ptr<()>,
+    requested: Ptr<bool>, set_delegate: Ptr<()>, release: Ptr<()>,
+
+    create* = (a: Alloc, window: Ptr<()>) Res<CloseRequests, AllocError> {
+        // Finish all fallible Zen allocations before acquiring native ownership.
+        requested = a.realloc<bool>(null_ptr<bool>(), 1).try();
+        requested.write(0, false);
+        name         = "ZenWindowCloseDelegate".c_text(a).try();
+        encoding     = "B@:@".c_text(a).try();
+        method       = selector(a, "windowShouldClose:").try();
+        set_delegate = selector(a, "setDelegate:").try();
+        release      = selector(a, "release").try();
+        allocate     = selector(a, "alloc").try();
+        initialize   = selector(a, "init").try();
+        base         = class(a, "NSObject").try();
+        type ::= Runtime.objc_getClass(name.ptr().to<c_char>());
+        type.is_null().then(() {
+            type = Runtime.objc_allocateClassPair(
+                base,
+                name.ptr().to<c_char>(),
+                0
+            );
+            (!type.is_null()).then(() {
+                Runtime.class_addMethod(
+                    type,
+                    method,
+                    callback(should_close),
+                    encoding.ptr().to<c_char>()
+                ).match({
+                    true  => Runtime.objc_registerClassPair(type),
+                    false => { Runtime.objc_disposeClassPair(
+                        type
+                    ); type = null_ptr<()>(); },
+                });
+            });
+        });
+        (type.is_null() || window.is_null()).then(
+            () { Err(AllocError.OutOfMemory).try(); }
+        );
+        delegate = Message.object(Message.object(type, allocate), initialize);
+        delegate.is_null().then(() { Err(AllocError.OutOfMemory).try(); });
+        Runtime.objc_setAssociatedObject(
+            delegate,
+            delegate,
+            requested.to<()>(),
+            0
+        );
+        Message.set_object(window, set_delegate, delegate);
+        Ok(CloseRequests(
+            window: window,
+            delegate: delegate,
+            requested: requested,
+            set_delegate: set_delegate,
+            release: release
+        ))
+    }
+    take* = (self: @Self) bool {
+        value = self.requested.read(0);
+        self.requested.write(0, false);
+        value
+    }
+    close* = (self :: @Self) () {
+        (!self.delegate.is_null()).then(() {
+            Message.set_object(self.window, self.set_delegate, null_ptr<()>());
+            Runtime.objc_setAssociatedObject(
+                self.delegate,
+                self.delegate,
+                null_ptr<()>(),
+                0
+            );
+            Message.void(self.delegate, self.release);
+            self.delegate = null_ptr<()>(); self.window = null_ptr<()>();
+            self.requested.write(0, false);
+        });
+    }
+}

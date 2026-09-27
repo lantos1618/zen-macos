@@ -7,7 +7,11 @@ Message, Metal, Point, Size, Rect, Color = macos.native
 selector, class, object, create, text = macos.objc
 FrameRate, monotonic = macos.display
 Pacer = macos.pacing
+CloseRequests = macos.window_events
 Capture, Recording, permission, capture_permission_text = macos.audio
+
+// Text borrows the app's keyboard storage until the next tick.
+KeyEvent* = { code*: u16, command*: bool, shift*: bool, text*: str }
 
 BUFFER_CAPACITY*: usize = 4096
 
@@ -28,6 +32,8 @@ Config* = {
     spectrum_label* :: str = "FFT",
     // Optional rolling excerpt for long input; the full input buffer is retained.
     input_tail_bytes* :: usize = 0,
+    // Forward editing keys to the host; F2 still controls allowed capture.
+    editable* :: bool = false,
 }
 
 App* = {
@@ -55,6 +61,10 @@ App* = {
     input: Ptr<u8>,
     used :: usize,
     frames* :: usize,
+    capture_enabled* :: bool,
+    keyboard: Ptr<u8>,
+    pending_key :: Res<KeyEvent>,
+    close_requests :: Res<CloseRequests>,
 
     submission_fps* = (self: @Self) f64 { self.rate.value }
     interval_p95_ms* = (self: @Self) f64 { self.rate.p95_ms }
@@ -109,7 +119,11 @@ App* = {
             stop_speech: stop_speech,
             input: input,
             used: 0,
-            frames: 0
+            frames: 0,
+            capture_enabled: true,
+            keyboard: a.realloc<u8>(null_ptr<u8>(), 1024).try(),
+            pending_key: None,
+            close_requests: None
         );
         app.initialize(a).match({
             Ok(_)      => Ok(app),
@@ -152,6 +166,11 @@ App* = {
             false
         );
         self.window          = window;
+        self.config.editable.then(
+            () { self.close_requests = Ok(
+                CloseRequests.create(a, window).try()
+            ); }
+        );
         Message.set_bool(window, released_when_closed, false);
         Message.set_size(
             window,
@@ -238,6 +257,8 @@ App* = {
     }
 
     close* = (self :: @Self) () {
+        self.close_requests.match({Ok(requests) => { owner ::= requests; owner.close(); }, None => ()});
+        self.close_requests = None;
         self.pacer.close();
         self.microphone.stop();
         // Stop speech before releasing its owner; the window owns its layers.
@@ -329,9 +350,47 @@ App* = {
         Ok(())
     }
 
+    allow_capture* = (self :: @Self, enabled: bool) () { self.capture_enabled = enabled; }
+
+    take_key* = (self :: @Self) Res<KeyEvent> {
+        result           = self.pending_key;
+        self.pending_key = None;
+        result
+    }
+
     key = (self :: @Self, a: Alloc, event: Ptr<()>) Res<bool, AllocError> {
+        code = Message.keycode(event, selector(a, "keyCode").try());
+        (self.config.editable && code != 120).match({
+            false => self.default_key(a, event),
+            true  => {
+                chars = object(a, event, "characters").try();
+                bytes = object(a, chars, "UTF8String").try().to<u8>();
+                count = Message.count(
+                    chars,
+                    selector(a, "lengthOfBytesUsingEncoding:").try(),
+                    4
+                );
+                flags = Message.integer(
+                    event,
+                    selector(a, "modifierFlags").try()
+                );
+                (count <= 1024).then(() {
+                    self.keyboard.copy_from(bytes, count);
+                    self.pending_key = Ok(KeyEvent(
+                        code: code,
+                        command: (flags / 1048576) % 2 == 1,
+                        shift: (flags / 131072) % 2 == 1,
+                        text: str_at(self.keyboard, count)
+                    ));
+                });
+                Ok(true)
+            },
+        })
+    }
+
+    default_key = (self :: @Self, a: Alloc, event: Ptr<()>) Res<bool, AllocError> {
         key = Message.keycode(event, selector(a, "keyCode").try());
-        (key == 120).then(() {
+        (key == 120 && self.capture_enabled).then(() {
             self.microphone_error = self.microphone.active().match({
                 true  => self.microphone.stop(),
                 false => self.microphone.start(),
@@ -505,13 +564,14 @@ App* = {
     tick* = (self :: @Self, a: Alloc) Res<bool, AllocError> {
         frame_pool = create(a, "NSAutoreleasePool").try();
         @scope.defer(() { Message.void(frame_pool, self.release); });
-        frame_ready = self.pacer.wait(a).try();
-        until       = Message.date(
+        self.pending_key = None;
+        frame_ready      = self.pacer.wait(a).try();
+        until            = Message.date(
             class(a, "NSDate").try(),
             selector(a, "dateWithTimeIntervalSinceNow:").try(),
             0.0
         );
-        event       = Message.event(
+        event            = Message.event(
             self.application,
             selector(
                 a,
@@ -538,6 +598,17 @@ App* = {
         (capture_error != 0).then(
             () { self.microphone_error = capture_error; }
         );
+        self.close_requests.match({
+            Ok(requests) => requests.take().then(
+                () { self.pending_key = Ok(KeyEvent(
+                    code: 53,
+                    command: false,
+                    shift: false,
+                    text: ""
+                )); }
+            ),
+            None         => (),
+        });
         frame_ready.then(() { self.draw(a).try(); });
         Ok(keep && Message.boolean(self.window, selector(a, "isVisible").try()))
     }

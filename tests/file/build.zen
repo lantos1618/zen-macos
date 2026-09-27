@@ -1,0 +1,12 @@
+Builder, BuildError = std.build
+build = (b :: Builder) Res<(), BuildError> {
+    macos = b.lib(
+        "macos",
+        {src: Path("../../src/macos.zen"), libs: [], paths: []}
+    ).try();
+    b.exe(
+        "file-state",
+        {src: Path("main.zen"), deps: [macos], out: Ok(Path("../../build/file-state"))}
+    ).try();
+    Ok(())
+}

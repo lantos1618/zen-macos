@@ -64,6 +64,62 @@ run, call `close`; repeated `close` calls are safe. Keep the caller's allocator
 alive until closing: it owns the input storage. Do not copy live `App` values;
 the current language does not enforce unique ownership of native handles.
 
+## App-owned editing and close requests
+
+Set `Config.editable: true` to own text editing. After each `App.tick(a)`, call
+`take_key()` before the next tick. It returns an optional `KeyEvent` containing
+native `code: u16`, `command: bool`, `shift: bool`, and UTF-8 `text: str`. Text
+borrows the app's keyboard storage until the next tick; copy it before keeping
+it or sending it to another thread. The slot is cleared each tick, and text
+above 1,024 bytes per native event is ignored. This is bounded key delivery,
+not a text editor or a complete native text-input/IME implementation.
+
+In editable mode Enter, Backspace and Escape are forwarded instead of changing
+the SDK input buffer or speaking/closing automatically. The window close button
+also produces code 53 with empty text, allowing the host to save or refuse to
+close. The host owns document state, shortcuts and the decision to leave its
+loop. F2 remains SDK-controlled. `allow_capture(false)` disables its capture
+toggle while, for example, a speech worker prepares; it does not stop an already
+active capture or restrict direct calls to `Capture.start()`.
+
+`macos.window_events.CloseRequests.create(a, window)` implements close-button
+interception underneath `App`. Its delegate sets a stable flag and refuses
+native closure; `take()` consumes the flag. `close()` detaches and releases the
+delegate and is repeatable. Keep its allocator and window alive through close,
+use it only on the main thread, and do not copy a live owning handle. `App`
+manages this lifecycle automatically when editable mode is enabled. This is
+window-close interception, not application-termination or unsaved-document UI.
+
+## Atomic file publication
+
+`macos.file.replace(a, path, bytes, existing)` returns
+`Res<(), FileError | AllocError>`. Pass a short-lived scratch arena: temporary
+memory belongs to that allocator until its arena is destroyed. Native file
+descriptors and staging paths are cleaned up before return. The parent directory
+must exist. Empty paths, embedded NULs, and final-component symlinks are refused.
+
+The helper writes a same-directory temporary file, fsyncs and closes it, then
+publishes it. With `existing: false`, exclusive hardlink publication refuses any
+existing destination, including one created after the caller checked. New files
+start with private 0600 permissions. With `existing: true`, it copies permissions,
+ACLs and extended attributes, refreshes access/modification time, and atomically
+renames over the destination. It uses direct Darwin bindings; no C shim is needed.
+
+Applications must detect external edits themselves. Existing-file rename still
+has a check-to-publication race with concurrent writers; this is not
+compare-and-swap. Parent-directory symlinks are allowed. No directory fsync is
+performed, so power-loss durability is not promised. This is a blocking API;
+large writes and syncs belong outside a latency-sensitive UI loop.
+
+```sh
+python3 tests/file/run.py
+```
+
+The headless native test covers new/existing saves, executable permissions,
+extended attributes, fresh modification time, empty content, collisions, missing
+paths, symlink refusal and staging cleanup. It does not inject disk-full or fsync
+failures. See [test details](tests/file/README.md).
+
 ## Architecture
 
 - `src/native.zen`: header-backed native declarations and explicit typed
@@ -71,6 +127,8 @@ the current language does not enforce unique ownership of native handles.
 - `src/objc.zen`: Zen helpers for selectors, classes, native strings, and
   Objective-C ownership.
 - `src/macos.zen`: window lifecycle, input, rendering, and speech in Zen.
+- `src/window_events.zen`: main-thread close interception for app-owned editing.
+- `src/file.zen`: atomic file publication and macOS metadata preservation.
 - `src/pacing.zen`: main-run-loop Metal display-link delegate and older-system
   deadline fallback; direct native bindings with Zen callback state.
 - `src/display.zen`: submitted-frame timing using portable `std.stats` samples.
@@ -241,7 +299,7 @@ with the main bundle's resource directory. It copies Foundation's UTF-8 path
 before draining its local autorelease pool, and works from the bundled
 executable regardless of the shell working directory. Applications own the
 configuration format and filesystem policy; this helper does not load a model
-or write settings. Zen Code uses it for development-bundle model configuration.
+or write settings. Writable application settings belong outside a signed app bundle.
 
 Reproducible capture-buffer measurements are in [benchmarks](benchmarks/README.md)
 and [measured results](benchmarks/RESULTS.md); they do not activate a microphone.

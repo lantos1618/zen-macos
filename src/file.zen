@@ -1,0 +1,104 @@
+// Atomic publication of a same-directory staged file on macOS. An existing
+// destination still needs application-level conflict checks: rename replaces
+// whichever directory entry exists at publication time. File data is fsynced;
+// directory durability across power loss is not promised.
+Ptr, null_ptr = std.mem
+c_text = std.text
+
+Native = c.bind("unistd.h", {
+    // C converts ssize_t -1 into usize.MAX, checked before using byte counts.
+    write* = (fd: i32, bytes: Ptr<u8>, count: usize) usize
+    fsync* = (fd: i32) i32
+    close* = (fd: i32) i32
+    unlink* = (path: Ptr<c_char>) i32
+    link* = (source: Ptr<c_char>, destination: Ptr<c_char>) i32
+    readlink* = (path: Ptr<c_char>, bytes: Ptr<c_char>, count: usize) usize
+})
+Files = c.bind("fcntl.h", { open* = (path: Ptr<c_char>, flags: i32) i32 })
+Temporary = c.bind("stdlib.h", { mkstemp* = (template: Ptr<c_char>) i32 })
+Publish = c.bind("stdio.h", { rename* = (source: Ptr<c_char>, destination: Ptr<c_char>) i32 })
+Metadata = c.bind("copyfile.h", { fcopyfile* = (source: i32, destination: i32, state: Ptr<()>, flags: u32) i32 })
+Times = c.bind("sys/time.h", { futimes* = (fd: i32, times: Ptr<()>) i32 })
+Errors = c.bind("errno.h", { __error* = () Ptr<i32> })
+
+FileError* = InvalidPath
+    | Symlink
+    | OpenFailed
+    | WriteFailed
+    | MetadataFailed
+    | SyncFailed
+    | PublishFailed
+
+// existing=false publishes exclusively: a raced-in file is never overwritten.
+// existing=true preserves permissions, ACLs and extended attributes; save sets
+// access and modification time to now. Use a short-lived scratch arena: all
+// temporary memory belongs to a until its arena is destroyed. Native file
+// descriptors and staging paths are cleaned up before this function returns.
+// The caller owns external-change detection. Final-component symlinks are refused.
+
+replace* = (a: Alloc, path: str, bytes: str, existing: bool) Res<(), FileError
+    | AllocError> {
+    (path.len > 0 && !path.contains(0)).ensure(FileError.InvalidPath).try();
+    destination = path.c_text(a).try();
+    probe       = a.realloc<u8>(null_ptr<u8>(), 1).try();
+    symbolic    = Native.readlink(
+        destination.ptr().to<c_char>(),
+        probe.to<c_char>(),
+        1
+    );
+    (symbolic == usize.MAX).ensure(FileError.Symlink).try();
+    // Darwin ENOENT=2, EINVAL=22 (an existing non-symlink).
+    errno = Errors.__error().read(0);
+    (errno == 2 || errno == 22).ensure(FileError.InvalidPath).try();
+    template  = a.String("{}.zen-XXXXXX", path).try();
+    temporary = template.view().c_text(a).try();
+    // A pointer slot gives the defer the updated descriptor after explicit close.
+    descriptor = a.create<i32>().try();
+    fd         = Temporary.mkstemp(temporary.ptr().to<c_char>());
+    (fd >= 0).ensure(FileError.OpenFailed).try();
+    descriptor.write(0, fd);
+    @scope.defer(() {
+        (descriptor.read(0) >= 0).then(() { Native.close(descriptor.read(0)); });
+        Native.unlink(temporary.ptr().to<c_char>());
+    });
+    offset ::= 0;
+    loop(offset < bytes.len, (h) {
+        count = Native.write(
+            fd,
+            bytes.ptr().offset(offset),
+            bytes.len - offset
+        );
+        (count > 0 && count <= bytes.len - offset).match({
+            true  => { offset = offset + count; },
+            false => { (count == usize.MAX && Errors.__error().read(0) == 4).ensure(FileError.WriteFailed).try(); },
+        });
+    });
+    existing.then(() {
+        // Darwin O_NOFOLLOW=0x100, O_RDONLY=0. This also catches a symlink
+        // introduced since readlink. Use descriptors for metadata copying.
+        source = Files.open(destination.ptr().to<c_char>(), 256);
+        (source >= 0).ensure(FileError.OpenFailed).try();
+        @scope.defer(() { Native.close(source); });
+        // copyfile.h: COPYFILE_STAT=2, COPYFILE_ACL=1, COPYFILE_XATTR=4.
+        (Metadata.fcopyfile(source, fd, null_ptr<()>(), 7) == 0).ensure(FileError.MetadataFailed).try();
+    });
+    // A content save must get a fresh mtime even when COPYFILE_STAT copied
+    // the original timestamps. NULL sets both access and modification time now.
+    (Times.futimes(fd, null_ptr<()>()) == 0).ensure(FileError.MetadataFailed).try();
+    (Native.fsync(fd) == 0).ensure(FileError.SyncFailed).try();
+    closed = Native.close(fd);
+    descriptor.write(0, -1);
+    (closed == 0).ensure(FileError.WriteFailed).try();
+    result = existing.match({
+        true  => Publish.rename(
+            temporary.ptr().to<c_char>(),
+            destination.ptr().to<c_char>()
+        ),
+        false => Native.link(
+            temporary.ptr().to<c_char>(),
+            destination.ptr().to<c_char>()
+        ),
+    });
+    (result == 0).ensure(FileError.PublishFailed).try();
+    Ok(())
+}
