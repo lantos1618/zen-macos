@@ -146,9 +146,9 @@ run must execute on the main thread with WindowServer access.
 `macos.audio.Capture` owns a main-run-loop AudioQueue. `create(a)` allocates
 bounded buffers but does not start recording. `start()` is an explicit user
 action; `stop()` disposes the queue. Call `poll()` during event processing to
-stop on callback failure or after the 30-second recording limit. `samples(out)`
+stop on callback failure or the default bounded 30-second limit. `samples(out)`
 copies the latest 1024 mono samples; `recording()` borrows up to 30 seconds of
-16 kHz float32 audio until the next recording. Keep the allocator alive until
+16 kHz float32 audio until the next recording or prefix discard. Keep the allocator alive until
 `closed()` confirms queue disposal. A live Capture must not be copied.
 
 The app bundle declares `NSMicrophoneUsageDescription`. macOS controls access;
@@ -203,3 +203,36 @@ authorization query is undetermined or unavailable but audio has arrived,
 `capture_permission_text` reports “Microphone audio received” instead of claiming
 a permission prompt is pending. Explicit denied/restricted results remain
 visible. This does not reinterpret the native result as an authorization grant.
+
+### Continuous capture
+
+The SDK defaults to a bounded 30-second recording. Before starting, an app can
+call `capture.continuous(true)` to opt into consumption of an ongoing stream.
+It returns false if a queue is already open. After copying/submitting an audio
+segment to its worker, the main-thread app calls `discard_prefix(sample_count)`.
+This shifts the remaining prefix safely, without changing the FFT ring, signal
+state, capture session, or stop generation. Existing borrowed recording views
+are invalidated by the discard. Invalid counts return false without mutation.
+
+The buffer still holds at most 480000 samples. If a continuous consumer falls
+behind, `CAPTURE_OVERFLOW` (`-70001`) is reported and `poll()` stops capture;
+there is no silent overwrite or unreported audio loss. A new start clears that
+error. Capture views include samples already delivered by AudioQueue callbacks;
+an immediate stop can discard samples still pending in the hardware queue.
+
+Run the synthetic callback-state checks without opening a microphone:
+
+```sh
+python3 tests/audio/run_continuous.py --zen ../zen/zen
+```
+
+They exercise overlapping/empty/full/invalid prefix removal, unchanged FFT and
+session state, more than 30 seconds with periodic consumption, sticky overflow,
+and the unchanged bounded default.
+
+`Config.input_tail_bytes` controls how much recent input is displayed. Its
+zero default displays all text. A positive limit shows the last bytes, advances
+the boundary to a UTF-8 codepoint, and prefixes an ellipsis when text is omitted;
+the full input buffer remains available. Zen TUI uses 600 bytes to keep recent
+dictation visible in the default 960×600 window. Smaller windows can still clip
+text; this is a display limit, not scrolling or text truncation in storage.

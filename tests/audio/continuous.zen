@@ -1,0 +1,59 @@
+// Appended to audio.zen by run_continuous.py to exercise private callback state
+// with synthetic samples. No queue is created and microphone APIs never start.
+main = (env: Env) Res<i32, AllocError> {
+    arena ::= env.mem.alloc();
+    capture  = Capture.create(arena).try();
+    incoming = arena.realloc<f32>(null_ptr<f32>(), 4).try();
+    incoming.write(0, 0.25);
+    incoming.write(1, -0.5);
+    incoming.write(2, 0.75);
+    incoming.write(3, 1.0);
+    before = arena.realloc<f64>(null_ptr<f64>(), SAMPLE_COUNT).try();
+    after  = arena.realloc<f64>(null_ptr<f64>(), SAMPLE_COUNT).try();
+    good  ::= capture.continuous(true);
+    state ::= capture.state.read(0);
+    state.running = true;
+    state.session = 7;
+    state.append(incoming, 4);
+    capture.state.write(0, state);
+    capture.samples(before);
+    good = good && !capture.continuous(false) && capture.discard_prefix(2);
+    view = capture.recording();
+    good = good && view.count == 2 && view.data.read(0) == 0.75 && view.data.read(1) == 1.0;
+    good = good && !capture.discard_prefix(3) && capture.discard_prefix(0);
+    good = good && capture.recording().count == 2 && capture.session() == 7 && capture.generation() == 0;
+    capture.samples(after);
+    Range(0, SAMPLE_COUNT).loop((i) { good = good && before.read(i) == after.read(i); });
+    good           = good && capture.received_audio();
+    state          = capture.state.read(0);
+    state.recorded = RECORDING_CAPACITY - 1;
+    state.append(incoming, 1);
+    capture.state.write(0, state);
+    good  = good && capture.poll() == 0 && capture.active() && capture.recording().count == RECORDING_CAPACITY;
+    state = capture.state.read(0);
+    state.append(incoming.offset(1), 1);
+    capture.state.write(0, state);
+    good    = good && capture.status() == CAPTURE_OVERFLOW;
+    good    = good && capture.poll() == CAPTURE_OVERFLOW && !capture.active();
+    good    = good && capture.generation() == 1 && capture.session() == 7;
+    good    = good && capture.recording().data.read(
+        RECORDING_CAPACITY - 1
+    ) == 0.25;
+    good    = good && capture.discard_prefix(
+        RECORDING_CAPACITY
+    ) && capture.recording().count == 0;
+    good    = good && capture.status() == CAPTURE_OVERFLOW;
+    bounded = Capture.create(arena).try();
+    bounded_state ::= bounded.state.read(0);
+    bounded_state.running  = true;
+    bounded_state.recorded = RECORDING_CAPACITY - 1;
+    bounded_state.append(incoming, 2);
+    bounded.state.write(0, bounded_state);
+    good = good && bounded.status() == 0 && bounded.poll() == 0 && !bounded.active();
+    good = good && bounded.generation() == 1 && bounded.recording().count == RECORDING_CAPACITY;
+    println(
+        "continuous discard, unchanged FFT, explicit overflow and bounded default {}",
+        good
+    );
+    Ok(good.match({true => 0, false => 1}))
+}

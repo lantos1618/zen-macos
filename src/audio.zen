@@ -64,10 +64,12 @@ capture_permission_text* = (value: Permission, received_audio: bool) str {
 SAMPLE_COUNT*: usize = 1024
 SAMPLE_RATE*: f64 = 16000.0
 RECORDING_CAPACITY*: usize = 480000
+// Continuous capture cannot keep up with its consumer; audio was not retained.
+CAPTURE_OVERFLOW*: i32 = -70001
 
 // A bounded view of the captured prefix, available during capture or after
 // stop. On the main thread, existing prefix samples stay unchanged until the
-// next start attempt; newly received audio extends the count of a later view.
+// next start attempt or discard_prefix; new audio extends a later view's count.
 // Copy or serialize on the main thread before sending work to another thread.
 // The allocator must outlive every view.
 Recording* = { data*: Ptr<f32>, count*: usize, rate*: u32 }
@@ -115,6 +117,32 @@ State = {
     error :: i32,
     running :: bool,
     received_audio :: bool,
+    continuous :: bool,
+
+    append = (self :: @Self, incoming: Ptr<f32>, count: usize) () {
+        Range(0, count).loop((i) {
+            (self.error == 0).then(() {
+                (self.continuous && self.recorded >= RECORDING_CAPACITY).match({
+                    true  => { self.error = CAPTURE_OVERFLOW; },
+                    false => {
+                        sample = incoming.read(i);
+                        (sample > 0.0 || sample < 0.0).then(
+                            () { self.received_audio = true; }
+                        );
+                        self.data.write(self.next, sample.to_f64());
+                        (self.recorded < RECORDING_CAPACITY).then(() {
+                            self.recording.write(self.recorded, sample);
+                            self.recorded = self.recorded + 1;
+                        });
+                        self.next = (self.next + 1) % SAMPLE_COUNT;
+                        (self.count < SAMPLE_COUNT).then(
+                            () { self.count = self.count + 1; }
+                        );
+                    },
+                });
+            });
+        });
+    }
 }
 
 input_callback = (
@@ -131,27 +159,15 @@ input_callback = (
         buffer = incoming.to<Buffer>().read(0);
         bytes  = (buffer.size <= buffer.capacity).match({true => buffer.size, false => buffer.capacity});
         count  = bytes.to_usize() / 4;
-        Range(0, count).loop((i) {
-            sample = buffer.data.read(i);
-            (sample > 0.0 || sample < 0.0).then(
-                () { state.received_audio = true; }
-            );
-            state.data.write(state.next, sample.to_f64());
-            (state.recorded < RECORDING_CAPACITY).then(() {
-                state.recording.write(state.recorded, sample);
-                state.recorded = state.recorded + 1;
-            });
-            state.next = (state.next + 1) % SAMPLE_COUNT;
-            (state.count < SAMPLE_COUNT).then(
-                () { state.count = state.count + 1; }
+        state.append(buffer.data, count);
+        (state.error == 0).then(() {
+            state.error = Queue.AudioQueueEnqueueBuffer(
+                queue,
+                incoming,
+                0,
+                null_ptr<()>()
             );
         });
-        state.error = Queue.AudioQueueEnqueueBuffer(
-            queue,
-            incoming,
-            0,
-            null_ptr<()>()
-        );
         state_ptr.write(0, state);
     });
 }
@@ -183,6 +199,7 @@ Capture* = {
                 count: 0,
                 error: 0,
                 running: false,
+                continuous: false,
                 received_audio: false
             )
         );
@@ -207,6 +224,37 @@ Capture* = {
 
     // Nonzero samples observed during this capture session, not an OS grant.
     received_audio* = (self: @Self) bool { self.state.read(0).received_audio }
+
+    // Choose before start; mode changes while a queue is live are rejected.
+    continuous* = (self: @Self, enabled: bool) bool {
+        state ::= self.state.read(0);
+        (self.queue.read(0).is_null() && !state.running).match({
+            true  => {
+                state.continuous = enabled;
+                self.state.write(0, state);
+                true
+            },
+            false => false,
+        })
+    }
+
+    // Main-thread consumption after copying/submitting audio elsewhere. This
+    // invalidates previous recording views but leaves the session and FFT ring.
+    discard_prefix* = (self: @Self, count: usize) bool {
+        state ::= self.state.read(0);
+        (count <= state.recorded).match({
+            true  => {
+                remaining = state.recorded - count;
+                Range(0, remaining).loop((i) {
+                    state.recording.write(i, state.recording.read(count + i));
+                });
+                state.recorded = remaining;
+                self.state.write(0, state);
+                true
+            },
+            false => false,
+        })
+    }
 
     // Call only after an explicit microphone action. macOS controls the access
     // prompt; the app bundle must supply NSMicrophoneUsageDescription.
@@ -296,7 +344,7 @@ Capture* = {
     // generation counter advances so the completed recording can be consumed.
     poll* = (self: @Self) i32 {
         state = self.state.read(0);
-        (state.running && (state.recorded >= RECORDING_CAPACITY || state.error != 0)).match({
+        (state.running && ((!state.continuous && state.recorded >= RECORDING_CAPACITY) || state.error != 0)).match({
             true  => {
                 stopped = self.stop();
                 (state.error != 0).match({true => state.error, false => stopped})

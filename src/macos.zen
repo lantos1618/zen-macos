@@ -25,6 +25,8 @@ Config* = {
     prompt*: str,
     greeting*: str,
     spectrum_label* :: str = "FFT",
+    // Optional rolling excerpt for long input; the full input buffer is retained.
+    input_tail_bytes* :: usize = 0,
 }
 
 App* = {
@@ -250,13 +252,21 @@ App* = {
             selector(a, "setDisableActions:").try(),
             true
         );
+        start ::= 0;
+        (self.config.input_tail_bytes > 0 && self.used > self.config.input_tail_bytes).then(() {
+            start = self.used - self.config.input_tail_bytes;
+            loop(start < self.used && self.input.read(start) >= 128 && self.input.read(start) < 192, (h) {
+                start = start + 1;
+            });
+        });
         contents = a.String(
-            "{}\n\n{}\n{}\n\n{}{}",
+            "{}\n\n{}\n{}\n\n{}{}{}",
             self.config.heading,
             self.config.description,
             self.notice,
             self.config.prompt,
-            str_at(self.input, self.used)
+            (start > 0).match({true => "… ", false => ""}),
+            str_at(self.input.offset(start), self.used - start)
         ).try();
         Message.set_object(
             self.text_layer,
