@@ -309,3 +309,11 @@ unclassified: visibility, display power state and scheduling need correlation
 before attributing it to macOS throttling or application work. No microphone or
 model inference ran in these SDK diagnostics. Both failures are retained here;
 this change does not claim stable 60 FPS during transcription.
+
+A subsequent bounded Metal trace correlated its slowdown with the process
+transitioning to background at 2.839 seconds: submissions then fell to roughly
+three per second while GPU clear durations stayed around 20 microseconds.
+This supports background throttling for that traced run, not an inference or
+FFT bottleneck. It does not classify every earlier failure or measure the full
+Core Animation compositor. Keep the window foreground when measuring active
+pacing; lowering background presentation frequency is not itself a defect.
