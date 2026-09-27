@@ -5,7 +5,8 @@ str, String, str_at = std.text
 Range = std.core
 Message, Metal, Point, Size, Rect, Color = macos.native
 selector, class, object, create, text = macos.objc
-FrameRate = macos.display
+FrameRate, monotonic = macos.display
+Pacer = macos.pacing
 Capture, Recording, permission, capture_permission_text = macos.audio
 
 BUFFER_CAPACITY*: usize = 4096
@@ -39,6 +40,7 @@ App* = {
     status_layer :: Ptr<()>,
     bars: Ptr<Ptr<()>>,
     rate :: FrameRate,
+    pacer :: Pacer,
     levels: Ptr<f64>,
     microphone*: Capture,
     microphone_error :: i32,
@@ -53,6 +55,13 @@ App* = {
     input: Ptr<u8>,
     used :: usize,
     frames* :: usize,
+
+    submission_fps* = (self: @Self) f64 { self.rate.value }
+    interval_p95_ms* = (self: @Self) f64 { self.rate.p95_ms }
+    interval_p99_ms* = (self: @Self) f64 { self.rate.p99_ms }
+    display_link* = (self: @Self) bool { self.pacer.display_link() }
+    display_updates* = (self: @Self) usize { self.pacer.updates() }
+    coalesced_updates* = (self: @Self) usize { self.pacer.coalesced() }
 
     open* = (a: Alloc, title: str) Res<App, AllocError> {
         App.configured(
@@ -76,7 +85,7 @@ App* = {
         levels       = a.realloc<f64>(null_ptr<f64>(), 32).try();
         Range(0, 32).loop((i) { levels.write(i, 0.0); });
         microphone = Capture.create(a).try();
-        app   ::= App(
+        app ::= App(
             config: config,
             application: null_ptr<()>(),
             window: null_ptr<()>(),
@@ -85,7 +94,8 @@ App* = {
             text_layer: null_ptr<()>(),
             status_layer: null_ptr<()>(),
             bars: bars,
-            rate: FrameRate.create(),
+            rate: FrameRate.create(a).try(),
+            pacer: Pacer.create(a).try(),
             levels: levels,
             microphone: microphone,
             microphone_error: 0,
@@ -101,16 +111,23 @@ App* = {
             used: 0,
             frames: 0
         );
-        ready ::= false;
-        @scope.defer(() { (!ready).then(() { app.close(); }); });
-        pool            = create(a, "NSAutoreleasePool").try();
-        app.pool        = pool;
-        application     = object(
+        app.initialize(a).match({
+            Ok(_)      => Ok(app),
+            Err(error) => { app.close(); Err(error) },
+        })
+    }
+
+    // Keep cleanup on the actual partially initialized value. A deferred
+    // closure would capture a stale by-value snapshot of this local App.
+    initialize = (self :: @Self, a: Alloc) Res<(), AllocError> {
+        pool             = create(a, "NSAutoreleasePool").try();
+        self.pool        = pool;
+        application      = object(
             a,
             class(a, "NSApplication").try(),
             "sharedApplication"
         ).try();
-        app.application = application;
+        self.application = application;
         Message.boolean_integer(
             application,
             selector(a, "setActivationPolicy:").try(),
@@ -134,7 +151,7 @@ App* = {
             2,
             false
         );
-        app.window           = window;
+        self.window          = window;
         Message.set_bool(window, released_when_closed, false);
         Message.set_size(
             window,
@@ -144,27 +161,27 @@ App* = {
         Message.set_object(
             window,
             selector(a, "setTitle:").try(),
-            text(a, config.title).try()
+            text(a, self.config.title).try()
         );
-        view       = object(a, window, "contentView").try();
-        app.view   = view;
-        device     = Metal.MTLCreateSystemDefaultDevice();
-        app.device = device;
-        queue      = object(a, device, "newCommandQueue").try();
-        app.queue  = queue;
-        layer      = object(a, class(a, "CAMetalLayer").try(), "layer").try();
-        app.layer  = layer;
+        view        = object(a, window, "contentView").try();
+        self.view   = view;
+        device      = Metal.MTLCreateSystemDefaultDevice();
+        self.device = device;
+        queue       = object(a, device, "newCommandQueue").try();
+        self.queue  = queue;
+        layer       = object(a, class(a, "CAMetalLayer").try(), "layer").try();
+        self.layer  = layer;
         Message.set_object(layer, selector(a, "setDevice:").try(), device);
         Message.set_integer(layer, selector(a, "setPixelFormat:").try(), 80);
         Message.set_bool(layer, selector(a, "setFramebufferOnly:").try(), true);
         Message.set_bool(view, selector(a, "setWantsLayer:").try(), true);
         Message.set_object(view, selector(a, "setLayer:").try(), layer);
-        text_layer     = object(
+        text_layer      = object(
             a,
             class(a, "CATextLayer").try(),
             "layer"
         ).try();
-        app.text_layer = text_layer;
+        self.text_layer = text_layer;
         Message.set_object(
             text_layer,
             selector(a, "setFont:").try(),
@@ -177,12 +194,12 @@ App* = {
             selector(a, "addSublayer:").try(),
             text_layer
         );
-        status_layer     = object(
+        status_layer      = object(
             a,
             class(a, "CATextLayer").try(),
             "layer"
         ).try();
-        app.status_layer = status_layer;
+        self.status_layer = status_layer;
         Message.set_object(
             status_layer,
             selector(a, "setFont:").try(),
@@ -205,7 +222,7 @@ App* = {
         ).try();
         Range(0, 32).loop((i) {
             bar = object(a, class(a, "CALayer").try(), "layer").try();
-            bars.write(i, bar);
+            self.bars.write(i, bar);
             Message.set_object(
                 bar,
                 selector(a, "setBackgroundColor:").try(),
@@ -213,14 +230,15 @@ App* = {
             );
             Message.set_object(layer, selector(a, "addSublayer:").try(), bar);
         });
-        speech     = create(a, "AVSpeechSynthesizer").try();
-        app.speech = speech;
-        app.refresh(a).try();
-        ready = true;
-        Ok(app)
+        speech      = create(a, "AVSpeechSynthesizer").try();
+        self.speech = speech;
+        self.pacer.start(a, self.layer).try();
+        self.refresh(a).try();
+        Ok(())
     }
 
     close* = (self :: @Self) () {
+        self.pacer.close();
         self.microphone.stop();
         // Stop speech before releasing its owner; the window owns its layers.
         Message.boolean_integer(self.speech, self.stop_speech, 0);
@@ -274,8 +292,10 @@ App* = {
             text(a, contents.view()).try()
         );
         status = a.String(
-            "FPS {} · mic {} · {} · code {} · F2 · {}",
+            "Submit {} FPS · p95 {} ms · p99 {} ms\nmic {} · {} · code {} · F2 · {}",
             self.rate.value,
+            self.rate.p95_ms,
+            self.rate.p99_ms,
             self.microphone.active().match({true => "ON", false => "off"}),
             capture_permission_text(
                 permission(a).try(),
@@ -402,7 +422,7 @@ App* = {
             selector(a, "setFrame:").try(),
             Rect(
                 origin: Point(x: 24.0, y: 24.0),
-                size: Size(width: bounds.size.width - 48.0, height: 24.0)
+                size: Size(width: bounds.size.width - 48.0, height: 44.0)
             )
         );
         transaction = class(a, "CATransaction").try();
@@ -421,7 +441,7 @@ App* = {
                 self.bars.read(i),
                 selector(a, "setFrame:").try(),
                 Rect(
-                    origin: Point(x: 24.0 + x * width, y: 60.0),
+                    origin: Point(x: 24.0 + x * width, y: 80.0),
                     size: Size(
                         width: width - 3.0,
                         height: 2.0 + self.levels.read(i) * 110.0
@@ -430,7 +450,15 @@ App* = {
             );
         });
         Message.void(transaction, selector(a, "commit").try());
-        drawable = object(a, self.layer, "nextDrawable").try();
+        drawable = self.pacer.display_link().match({
+            true  => self.pacer.take(),
+            false => object(a, self.layer, "nextDrawable").try(),
+        });
+        @scope.defer(
+            () { self.pacer.display_link().then(
+                () { Message.void(drawable, self.release); }
+            ); }
+        );
         (!drawable.is_null()).then(() {
             pass        = object(
                 a,
@@ -477,12 +505,13 @@ App* = {
     tick* = (self :: @Self, a: Alloc) Res<bool, AllocError> {
         frame_pool = create(a, "NSAutoreleasePool").try();
         @scope.defer(() { Message.void(frame_pool, self.release); });
-        until = Message.date(
+        frame_ready = self.pacer.wait(a).try();
+        until       = Message.date(
             class(a, "NSDate").try(),
             selector(a, "dateWithTimeIntervalSinceNow:").try(),
-            0.016
+            0.0
         );
-        event = Message.event(
+        event       = Message.event(
             self.application,
             selector(
                 a,
@@ -509,7 +538,7 @@ App* = {
         (capture_error != 0).then(
             () { self.microphone_error = capture_error; }
         );
-        self.draw(a).try();
+        frame_ready.then(() { self.draw(a).try(); });
         Ok(keep && Message.boolean(self.window, selector(a, "isVisible").try()))
     }
 
@@ -571,14 +600,23 @@ App* = {
                     (arg) { arg.eq("--smoke") }
                 ).match({ Ok(_) => true, None => false });
                 running ::= true;
-                ticks   ::= 0;
-                loop(running && (!smoke || ticks < 30), (h) {
+                deadline = monotonic() + 30.0;
+                loop(running && (!smoke || (self.frames < 30 && monotonic() < deadline)), (
+                    h
+                ) {
                     scratch ::= env.mem.alloc();
                     running = self.tick(scratch).try();
-                    ticks   = ticks + 1;
                 });
-                println("zen-macos: {} Metal frames", self.frames);
-                Ok((self.frames > 0).match({ true => 0, false => 1 }))
+                println(
+                    "zen-macos: {} Metal frames · display link {} · updates {} · coalesced {}",
+                    self.frames,
+                    self.display_link(),
+                    self.display_updates(),
+                    self.coalesced_updates()
+                );
+                Ok(
+                    (self.frames > 0 && (!smoke || self.frames >= 30)).match({ true => 0, false => 1 })
+                )
             },
         })
     }

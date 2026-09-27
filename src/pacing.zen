@@ -1,0 +1,192 @@
+// Display updates, audio callbacks, event handling and drawing share the main
+// run loop. The delegate owns no App pointer: its stable state outlives the link.
+Alloc, AllocError, Ptr, null_ptr = std.mem
+c_text = std.text
+callback = std.native
+Runtime, Message = macos.native
+selector, class, object, create, text = macos.objc
+monotonic = macos.display
+
+Loop = c.bind("CoreFoundation/CoreFoundation.h", {
+    CFRunLoopRunInMode* = (mode: Ptr<()>, seconds: f64, return_after_source: bool) i32
+})
+Rate = { minimum: f32, maximum: f32, preferred: f32 }
+SetRate = c.bind("objc/message.h", "objc_msgSend", {
+    range* = (receiver: Ptr<()>, selector: Ptr<()>, value: Rate) ()
+})
+State = {
+    drawable :: Ptr<()>,
+    updates :: usize,
+    coalesced :: usize,
+    drawable_selector: Ptr<()>,
+    retain: Ptr<()>,
+    release: Ptr<()>,
+}
+
+update = (
+    receiver : Ptr<()>,
+    method   : Ptr<()>,
+    link     : Ptr<()>,
+    value    : Ptr<()>
+) () {
+    pointer = Runtime.objc_getAssociatedObject(receiver, receiver).to<State>();
+    (!pointer.is_null()).then(() {
+        state ::= pointer.read(0);
+        state.updates = state.updates + 1;
+        (!state.drawable.is_null()).then(
+            () { state.coalesced = state.coalesced + 1; }
+        );
+        drawable = Message.object(value, state.drawable_selector);
+        Message.void(drawable, state.retain);
+        Message.void(state.drawable, state.release);
+        state.drawable = drawable;
+        pointer.write(0, state);
+    });
+}
+
+Pacer* = {
+    link :: Ptr<()>,
+    delegate :: Ptr<()>,
+    state: Ptr<State>,
+    invalidate: Ptr<()>,
+    release: Ptr<()>,
+    // Older macOS uses absolute deadlines, rather than wait + render duration.
+    deadline :: f64,
+    create* = (a: Alloc) Res<Pacer, AllocError> {
+        state   = a.realloc<State>(null_ptr<State>(), 1).try();
+        release = selector(a, "release").try();
+        state.write(
+            0,
+            State(
+                drawable: null_ptr<()>(),
+                updates: 0,
+                coalesced: 0,
+                drawable_selector: selector(a, "drawable").try(),
+                retain: selector(a, "retain").try(),
+                release: release
+            )
+        );
+        Ok(Pacer(
+            link: null_ptr<()>(),
+            delegate: null_ptr<()>(),
+            state: state,
+            invalidate: selector(a, "invalidate").try(),
+            release: release,
+            deadline: monotonic()
+        ))
+    }
+    start* = (self :: @Self, a: Alloc, layer: Ptr<()>) Res<(), AllocError> {
+        link_class = class(a, "CAMetalDisplayLink").try();
+        (!link_class.is_null() && self.link.is_null()).then(() {
+            name     = "ZenMetalDisplayDelegate".c_text(a).try();
+            encoding = "v@:@@".c_text(a).try();
+            method   = selector(a, "metalDisplayLink:needsUpdate:").try();
+            base     = class(a, "NSObject").try();
+            type ::= Runtime.objc_getClass(name.ptr().to<c_char>());
+            type.is_null().then(() {
+                type = Runtime.objc_allocateClassPair(
+                    base,
+                    name.ptr().to<c_char>(),
+                    0
+                );
+                (!type.is_null()).then(() {
+                    Runtime.class_addMethod(
+                        type,
+                        method,
+                        callback(update),
+                        encoding.ptr().to<c_char>()
+                    ).match({
+                        true  => Runtime.objc_registerClassPair(type),
+                        false => { Runtime.objc_disposeClassPair(
+                            type
+                        ); type = null_ptr<()>(); },
+                    });
+                });
+            });
+            (!type.is_null()).then(() {
+            self.delegate = Message.object(
+                Message.object(type, selector(a, "alloc").try()),
+                selector(a, "init").try()
+            );
+            Runtime.objc_setAssociatedObject(
+                self.delegate,
+                self.delegate,
+                self.state.to<()>(),
+                0
+            );
+            self.link = Message.object_arg(
+                Message.object(link_class, selector(a, "alloc").try()),
+                selector(a, "initWithMetalLayer:").try(),
+                layer
+            );
+            Message.set_object(
+                self.link,
+                selector(a, "setDelegate:").try(),
+                self.delegate
+            );
+            SetRate.range(
+                self.link,
+                selector(a, "setPreferredFrameRateRange:").try(),
+                Rate(minimum: 60.0, maximum: 60.0, preferred: 60.0)
+            );
+            Message.pair(
+                self.link,
+                selector(a, "addToRunLoop:forMode:").try(),
+                object(a, class(a, "NSRunLoop").try(), "mainRunLoop").try(),
+                text(a, "kCFRunLoopDefaultMode").try()
+            );
+            });
+        });
+        Ok(())
+    }
+    updates* = (self: @Self) usize { self.state.read(0).updates }
+    coalesced* = (self: @Self) usize { self.state.read(0).coalesced }
+    display_link* = (self: @Self) bool { !self.link.is_null() }
+    wait* = (self :: @Self, a: Alloc) Res<bool, AllocError> {
+        mode = text(a, "kCFRunLoopDefaultMode").try();
+        self.link.is_null().match({
+            true  => {
+                now = monotonic();
+                (self.deadline > now).then(
+                    () { Loop.CFRunLoopRunInMode(
+                        mode,
+                        self.deadline - now,
+                        false
+                    ); }
+                );
+                self.deadline = self.deadline + 1.0 / 60.0;
+                (self.deadline < monotonic()).then(
+                    () { self.deadline = monotonic() + 1.0 / 60.0; }
+                );
+                Ok(true)
+            },
+            false => {
+                // Audio/events may wake this early; tick remains responsive and
+                // the caller submits only when a display update is ready.
+                self.state.read(0).drawable.is_null().then(() { Loop.CFRunLoopRunInMode(mode, 1.0 / 60.0, true); });
+                Ok(!self.state.read(0).drawable.is_null())
+            },
+        })
+    }
+    take* = (self: @Self) Ptr<()> {
+        state ::= self.state.read(0);
+        result         = state.drawable;
+        state.drawable = null_ptr<()>();
+        self.state.write(0, state);
+        result
+    }
+    close* = (self :: @Self) () {
+        Message.void(self.link, self.invalidate);
+        Runtime.objc_setAssociatedObject(
+            self.delegate,
+            self.delegate,
+            null_ptr<()>(),
+            0
+        );
+        Message.void(self.link, self.release);
+        Message.void(self.delegate, self.release);
+        Message.void(self.take(), self.release);
+        self.link     = null_ptr<()>();
+        self.delegate = null_ptr<()>();
+    }
+}

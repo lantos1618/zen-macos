@@ -1,0 +1,54 @@
+App, Config = macos
+Pacer = macos.pacing
+monotonic = macos.display
+
+main = (env: Env) Res<i32, AllocError> {
+    passed ::= true;
+    steady        = env.argv.find(
+        (arg) { arg.eq("--steady") }
+    ).match({Ok(_) => true, None => false});
+    cycles: usize = steady.match({true => 1, false => 3});
+    target: usize = steady.match({true => 360, false => 120});
+    Range(0, cycles).loop((cycle) {
+        arena ::= env.mem.alloc();
+        app   ::= App.open(arena, "Zen pacing lifecycle test").try();
+        app.begin(arena).try();
+        deadline = monotonic() + 15.0;
+        running ::= true;
+        loop(running && app.frames < target && monotonic() < deadline, (h) {
+            scratch ::= env.mem.alloc();
+            running = app.tick(scratch).try();
+        });
+        println(
+            "cycle {}: frames {} link {} updates {} coalesced {}",
+            cycle,
+            app.frames,
+            app.display_link(),
+            app.display_updates(),
+            app.coalesced_updates()
+        );
+        passed = passed && app.frames == target;
+        app.display_link().then(
+            () { passed = passed && app.display_updates() >= app.frames; }
+        );
+        println(
+            "submit FPS {} interval p95 {}ms p99 {}ms",
+            app.submission_fps(),
+            app.interval_p95_ms(),
+            app.interval_p99_ms()
+        );
+        app.close();
+        app.close();
+    });
+    // No native link installed: exercise the old-system deadline fallback.
+    arena ::= env.mem.alloc();
+    pacer ::= Pacer.create(arena).try();
+    start = monotonic();
+    Range(0, 7).loop((i) { ready = pacer.wait(arena).try(); passed = passed && ready; });
+    elapsed = monotonic() - start;
+    passed  = passed && !pacer.display_link() && elapsed >= 0.08 && elapsed < 1.0;
+    pacer.close();
+    pacer.close();
+    println("fallback seven ticks: {} seconds; passed {}", elapsed, passed);
+    Ok(passed.match({true => 0, false => 1}))
+}

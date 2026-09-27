@@ -1,0 +1,15 @@
+Builder, BuildError = std.build
+build = (b :: Builder) Res<(), BuildError> {
+    macos = b.lib("macos", {
+        src: Path("../../src/macos.zen"), libs: ["objc"], paths: [],
+    }).try();
+    b.exe("pacing", {
+        src: Path("main.zen"), deps: [macos], language: "objective-c",
+        frameworks: [
+            "AppKit", "Foundation", "QuartzCore", "Metal", "AVFoundation",
+            "AudioToolbox", "CoreFoundation"
+        ],
+        out: Ok(Path("../../build/pacing")),
+    }).try();
+    Ok(())
+}

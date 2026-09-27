@@ -72,6 +72,9 @@ the current language does not enforce unique ownership of native handles.
 - `src/objc.zen`: Zen helpers for selectors, classes, native strings, and
   Objective-C ownership.
 - `src/macos.zen`: window lifecycle, input, rendering, and speech in Zen.
+- `src/pacing.zen`: main-run-loop Metal display-link delegate and older-system
+  deadline fallback; direct native bindings with Zen callback state.
+- `src/display.zen`: submitted-frame timing using portable `std.stats` samples.
 - `src/mlx.zen`: optional declarations for MLX C's Metal availability/capture
   APIs. This is not an inference engine and is not linked into the console.
 - `build.zen`: native library dependency, Objective-C compilation language,
@@ -248,3 +251,61 @@ or write settings. Zen Code uses it for development-bundle model configuration.
 
 Reproducible capture-buffer measurements are in [benchmarks](benchmarks/README.md)
 and [measured results](benchmarks/RESULTS.md); they do not activate a microphone.
+
+## Display pacing and threading
+
+On macOS 14+, `CAMetalDisplayLink` supplies a drawable on the main run loop.
+`App.tick` pumps that loop and submits only when a display update is ready;
+audio and other native sources may wake a tick without rendering. Do not count
+ticks as frames. The link requests 60 Hz; the system controls actual scheduling.
+On macOS 13 or when the native link is unavailable, an absolute 60 Hz deadline
+fallback avoids adding a fixed sleep to each frame's work.
+
+The delegate callback retains the latest drawable in stable allocator-owned
+state. It never receives an `App` address, calls user code, allocates Zen memory,
+or dispatches an actor. Close invalidates the link before releasing its delegate
+and pending drawable, before the caller may free the allocator. Lifecycle calls,
+`tick`, capture reads and all native UI operations must stay on the main thread.
+Inference belongs to a separate library's worker actor and returns copied data.
+
+The overlay reports submission FPS and p95/p99 **submission intervals**, using a
+bounded portable statistics buffer. These are neither GPU durations nor measured
+display-presented frame intervals. `display_link()`, `display_updates()` and
+`coalesced_updates()` expose scheduler diagnostics. A coalesced update means a
+new callback replaced a drawable not yet consumed by a tick, not a measured
+missed presentation deadline. No per-frame network telemetry is emitted.
+
+Desktop regression (three 120-frame link lifecycles, repeated closes, and
+link-free deadline fallback):
+
+```sh
+ZEN_STD=../zen/src ../zen/zen build tests/pacing
+./build/pacing
+./build/pacing --steady
+```
+
+The `--steady` variant runs one 360-frame window, leaving startup outside the
+last 240 intervals. Each test window has a fifteen-second bound per window. An occluded or minimized window can
+be throttled by macOS; run this test in a visible desktop session. The SDK smoke
+requires 30 submitted frames within 30 seconds.
+
+Allocation-failure cleanup is explicit: construction initializes a borrowed App
+and closes its current handles on error. It does not defer a stale by-value
+snapshot of a partially initialized App. The updated allocation-budget sweep
+passed 241 failure paths and 271 successful double closes.
+
+Observed on Apple M2 Pro/macOS 26.6.2: three 120-frame lifecycle runs passed,
+with 120 updates per run and no coalescing; link-free seven-tick fallback took
+0.101134 s. The allocation sweep also passed. These validate callback delivery
+and teardown, not a sustained 60 FPS guarantee.
+
+Longer desktop diagnostics were mixed. Two 360-frame windows ended at 60
+submission FPS with rolling p95 17.05/17.10 ms and p99 32.96/32.84 ms. A third
+window hit the 15-second bound at 349 frames, with updates slowing and a roughly
+one-second p99. A separate `--steady` run also failed its bound (164 frames,
+171 updates, seven coalesced updates; p95 1016.57 ms). That run's independent
+fallback still passed at 0.101112 s. The source of this scheduling slowdown is
+unclassified: visibility, display power state and scheduling need correlation
+before attributing it to macOS throttling or application work. No microphone or
+model inference ran in these SDK diagnostics. Both failures are retained here;
+this change does not claim stable 60 FPS during transcription.

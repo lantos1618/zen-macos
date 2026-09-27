@@ -7,6 +7,12 @@ Rect* = { origin*: Point, size*: Size }
 Color* = { red*: f64, green*: f64, blue*: f64, alpha*: f64 }
 
 Runtime* = c.bind("objc/runtime.h", {
+    objc_allocateClassPair* = (base: Ptr<()>, name: Ptr<c_char>, extra: usize) Ptr<()>
+    objc_disposeClassPair* = (type: Ptr<()>) ()
+    objc_registerClassPair* = (type: Ptr<()>) ()
+    class_addMethod* = (type: Ptr<()>, name: Ptr<()>, implementation: Ptr<()>, encoding: Ptr<c_char>) bool
+    objc_setAssociatedObject* = (object: Ptr<()>, key: Ptr<()>, value: Ptr<()>, policy: usize) ()
+    objc_getAssociatedObject* = (object: Ptr<()>, key: Ptr<()>) Ptr<()>
     objc_getClass* = (name: Ptr<c_char>) Ptr<()>
     sel_registerName* = (name: Ptr<c_char>) Ptr<()>
 })
@@ -14,6 +20,7 @@ Runtime* = c.bind("objc/runtime.h", {
 // Each signature is the exact Objective-C method ABI at its call site.
 // Struct returns below target Apple silicon; x86 stret is not supported.
 Message* = c.bind("objc/message.h", "objc_msgSend", {
+    pair* = (receiver: Ptr<()>, selector: Ptr<()>, first: Ptr<()>, second: Ptr<()>) ()
     object* = (receiver: Ptr<()>, selector: Ptr<()>) Ptr<()>
     object_arg* = (receiver: Ptr<()>, selector: Ptr<()>, value: Ptr<()>) Ptr<()>
     integer_arg* = (receiver: Ptr<()>, selector: Ptr<()>, value: u64) Ptr<()>

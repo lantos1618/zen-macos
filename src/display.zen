@@ -1,29 +1,58 @@
-// Frame submission rate measured against Core Animation's monotonic clock.
+// Core Animation timestamps share the display link's time base. General app
+// elapsed time should use Env.clock; sample statistics live in std.stats.
 Clock = c.bind("QuartzCore/QuartzCore.h", {
     CACurrentMediaTime* = () f64
 })
-
-// Seconds from Core Animation's monotonic clock, for elapsed-time updates.
-monotonic* = () f64 { Clock.CACurrentMediaTime() }
-
+Alloc, AllocError = std.mem
+Samples, Summary = std.stats
 round = std.math
 
+monotonic* = () f64 { Clock.CACurrentMediaTime() }
+
+// Submission intervals, not GPU execution or actual display presentation.
+// The rolling window holds 240 intervals; summary runs at most twice a second.
 FrameRate* = {
     start :: f64,
+    previous :: f64,
     count :: i32,
+    intervals :: Samples,
     value* :: f64,
+    p50_ms* :: f64,
+    p95_ms* :: f64,
+    p99_ms* :: f64,
 
-    create* = () FrameRate {
-        FrameRate(start: Clock.CACurrentMediaTime(), count: 0, value: 0.0)
+    create* = (a: Alloc) Res<FrameRate, AllocError> {
+        Ok(FrameRate(
+            start: monotonic(),
+            previous: 0.0,
+            count: 0,
+            intervals: Samples.create(a, 240).try(),
+            value: 0.0,
+            p50_ms: 0.0,
+            p95_ms: 0.0,
+            p99_ms: 0.0
+        ))
     }
 
     submitted* = (self :: @Self) bool {
-        self.count = self.count + 1;
-        now        = Clock.CACurrentMediaTime();
-        elapsed    = now - self.start;
+        now = monotonic();
+        (self.previous > 0.0).then(() {
+            self.intervals.record((now - self.previous) * 1000.0);
+        });
+        self.previous = now;
+        self.count    = self.count + 1;
+        elapsed       = now - self.start;
         (elapsed >= 0.5).match({
             true  => {
                 self.value = round(self.count.to_f64() / elapsed * 10.0) / 10.0;
+                self.intervals.summary().match({
+                    Ok(summary) => {
+                        self.p50_ms = round(summary.p50 * 100.0) / 100.0;
+                        self.p95_ms = round(summary.p95 * 100.0) / 100.0;
+                        self.p99_ms = round(summary.p99 * 100.0) / 100.0;
+                    },
+                    None        => (),
+                });
                 self.count = 0;
                 self.start = now;
                 true
