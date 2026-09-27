@@ -36,11 +36,28 @@ permission* = (a: Alloc) Res<Permission, AllocError> {
 
 permission_text* = (value: Permission) str {
     value.match({
-        NotDetermined => "Permission pending — press F2 and allow microphone access",
+        NotDetermined => "Microphone permission not reported — press F2 to start",
         Restricted    => "Microphone restricted by system policy",
         Denied        => "Microphone denied — enable in System Settings > Privacy & Security > Microphone",
         Authorized    => "Microphone authorized",
         Unavailable   => "Microphone authorization unavailable",
+    })
+}
+
+// Capture evidence is separate from the OS authorization result. Some launch
+// contexts report NotDetermined while AudioQueue delivers non-silent input.
+// Never relabel that result as Authorized or hide Denied/Restricted.
+capture_permission_text* = (value: Permission, received_audio: bool) str {
+    value.match({
+        NotDetermined => received_audio.match({
+            true  => "Microphone audio received",
+            false => permission_text(value),
+        }),
+        Unavailable   => received_audio.match({
+            true  => "Microphone audio received",
+            false => permission_text(value),
+        }),
+        _             => permission_text(value),
     })
 }
 
@@ -97,6 +114,7 @@ State = {
     count :: usize,
     error :: i32,
     running :: bool,
+    received_audio :: bool,
 }
 
 input_callback = (
@@ -115,6 +133,9 @@ input_callback = (
         count  = bytes.to_usize() / 4;
         Range(0, count).loop((i) {
             sample = buffer.data.read(i);
+            (sample > 0.0 || sample < 0.0).then(
+                () { state.received_audio = true; }
+            );
             state.data.write(state.next, sample.to_f64());
             (state.recorded < RECORDING_CAPACITY).then(() {
                 state.recording.write(state.recorded, sample);
@@ -161,7 +182,8 @@ Capture* = {
                 next: 0,
                 count: 0,
                 error: 0,
-                running: false
+                running: false,
+                received_audio: false
             )
         );
         format.write(
@@ -183,6 +205,9 @@ Capture* = {
         Ok(Capture(state: state, format: format, queue: queue, buffer: buffer))
     }
 
+    // Nonzero samples observed during this capture session, not an OS grant.
+    received_audio* = (self: @Self) bool { self.state.read(0).received_audio }
+
     // Call only after an explicit microphone action. macOS controls the access
     // prompt; the app bundle must supply NSMicrophoneUsageDescription.
     start* = (self: @Self) i32 {
@@ -190,12 +215,13 @@ Capture* = {
             false => self.status(),
             true  => {
                 state ::= self.state.read(0);
-                state.session  = state.session + 1;
-                state.recorded = 0;
-                state.next     = 0;
-                state.count    = 0;
-                state.error    = 0;
-                state.running  = false;
+                state.session        = state.session + 1;
+                state.received_audio = false;
+                state.recorded       = 0;
+                state.next           = 0;
+                state.count          = 0;
+                state.error          = 0;
+                state.running        = false;
                 self.state.write(0, state);
                 status ::= NewInput.create(
                     self.format,

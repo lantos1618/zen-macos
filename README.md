@@ -195,3 +195,11 @@ elapsed differences to drive smoothing so animation does not depend on frame
 rate. `Config.spectrum_label` defaults to `"FFT"`; applications can supply a
 label describing their displayed frequency range. Like the other config text,
 this string is borrowed and must remain valid throughout the app's run loop.
+
+The status display keeps authorization and observed capture separate.
+`Capture.received_audio()` records whether the current capture session has
+delivered nonzero samples; it resets on a new start attempt. When the native
+authorization query is undetermined or unavailable but audio has arrived,
+`capture_permission_text` reports “Microphone audio received” instead of claiming
+a permission prompt is pending. Explicit denied/restricted results remain
+visible. This does not reinterpret the native result as an authorization grant.

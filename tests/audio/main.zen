@@ -1,19 +1,25 @@
 // This regression never calls start and therefore never requests microphone
 // access. It checks zero initialization and cleanup before capture begins.
-Capture, SAMPLE_COUNT = macos.audio
+Capture, SAMPLE_COUNT, Permission, permission_text, capture_permission_text = macos.audio
 
 main = (env: Env) Res<i32, AllocError> {
     arena ::= env.mem.alloc();
     capture = Capture.create(arena).try();
     samples = arena.realloc<f64>(null_ptr<f64>(), SAMPLE_COUNT).try();
     count   = capture.samples(samples);
-    valid ::= count == 0 && !capture.active() && capture.status() == 0;
+    valid ::= !capture.received_audio() && count == 0 && !capture.active() && capture.status() == 0;
     Range(0, SAMPLE_COUNT).loop((i) { valid = valid && samples.read(i) == 0.0; });
     recording = capture.recording();
     valid     = valid && recording.count == 0 && recording.rate == 16000;
     valid     = valid && capture.generation() == 0 && capture.session() == 0;
     valid     = valid && capture.stop() == 0 && capture.stop() == 0;
     valid     = valid && capture.session() == 0 && capture.recording().count == 0;
+    valid     = valid && capture_permission_text(Permission.NotDetermined, true).eq("Microphone audio received");
+    valid     = valid && capture_permission_text(Permission.Unavailable, true).eq("Microphone audio received");
+    valid     = valid && capture_permission_text(Permission.NotDetermined, false).eq(permission_text(Permission.NotDetermined));
+    valid     = valid && capture_permission_text(Permission.Denied, true).eq(permission_text(Permission.Denied));
+    valid     = valid && capture_permission_text(Permission.Restricted, true).eq(permission_text(Permission.Restricted));
+    valid     = valid && capture_permission_text(Permission.Authorized, true).eq(permission_text(Permission.Authorized));
     println("empty samples, stable session and repeatable stop {}", valid);
     Ok(valid.match({ true => 0, false => 1 }))
 }

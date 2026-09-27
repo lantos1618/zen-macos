@@ -6,7 +6,7 @@ Range = std.core
 Message, Metal, Point, Size, Rect, Color = macos.native
 selector, class, object, create, text = macos.objc
 FrameRate = macos.display
-Capture, Recording, permission, permission_text = macos.audio
+Capture, Recording, permission, capture_permission_text = macos.audio
 
 BUFFER_CAPACITY*: usize = 4096
 
@@ -267,7 +267,10 @@ App* = {
             "FPS {} · mic {} · {} · code {} · F2 · {}",
             self.rate.value,
             self.microphone.active().match({true => "ON", false => "off"}),
-            permission_text(permission(a).try()),
+            capture_permission_text(
+                permission(a).try(),
+                self.microphone.received_audio()
+            ),
             self.microphone_error,
             self.config.spectrum_label
         ).try();
