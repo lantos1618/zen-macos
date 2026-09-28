@@ -3,10 +3,11 @@
 // whichever directory entry exists at publication time. File data is fsynced;
 // directory durability across power loss is not promised.
 Ptr, null_ptr = std.mem
-c_text = std.text
+c_text, str_at = std.text
 
 Native = c.bind("unistd.h", {
     // C converts ssize_t -1 into usize.MAX, checked before using byte counts.
+    read* = (fd: i32, bytes: Ptr<u8>, count: usize) usize
     write* = (fd: i32, bytes: Ptr<u8>, count: usize) usize
     fsync* = (fd: i32) i32
     close* = (fd: i32) i32
@@ -24,6 +25,8 @@ Errors = c.bind("errno.h", { __error* = () Ptr<i32> })
 FileError* = InvalidPath
     | Symlink
     | OpenFailed
+    | ReadFailed
+    | TooLarge
     | WriteFailed
     | MetadataFailed
     | SyncFailed
@@ -101,4 +104,39 @@ replace* = (a: Alloc, path: str, bytes: str, existing: bool) Res<(), FileError
     });
     (result == 0).ensure(FileError.PublishFailed).try();
     Ok(())
+}
+
+// Read at most limit+1 bytes to distinguish an exact-capacity file from an
+// oversized one without trusting a racy size query. The returned view belongs
+// to a; use a short-lived scratch arena. Symlinks are followed, like Fs.read.
+read_bounded* = (a: Alloc, path: str, limit: usize) Res<str, FileError
+    | AllocError> {
+    (path.len > 0 && !path.contains(0)).ensure(FileError.InvalidPath).try();
+    (limit < usize.MAX).ensure(FileError.TooLarge).try();
+    name  = path.c_text(a).try();
+    bytes = a.realloc<u8>(null_ptr<u8>(), limit + 1).try();
+    fd    = Files.open(name.ptr().to<c_char>(), 0);
+    (fd >= 0).ensure(FileError.OpenFailed).try();
+    @scope.defer(() { Native.close(fd); });
+    used: usize ::= 0;
+    ended       ::= false;
+    loop(!ended && used <= limit, (h) {
+        count = Native.read(fd, bytes.offset(used), limit + 1 - used);
+        (count == usize.MAX).match({
+            true  => { (Errors.__error().read(0) == 4).ensure(FileError.ReadFailed).try(); },
+            false => {
+                (count == 0).match({
+                    true  => { ended = true; },
+                    false => {
+                        (count <= limit + 1 - used).ensure(
+                            FileError.ReadFailed
+                        ).try();
+                        used = used + count;
+                    },
+                });
+            },
+        });
+    });
+    (used <= limit).ensure(FileError.TooLarge).try();
+    Ok(str_at(bytes, used))
 }

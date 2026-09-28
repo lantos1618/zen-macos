@@ -1,0 +1,63 @@
+Faults = c.bind("DISPOSAL_HEADER", {
+    test_config* = (disposal: i32, allocation: i32, creation: i32) ()
+    test_tokens* = () i32
+    test_creates* = () i32
+    test_user* = () Ptr<()>
+})
+
+quarantine = (env: Env) Res<bool, AllocError> {
+    arena ::= env.mem.alloc();
+    capture = Capture.create(arena).try();
+    Faults.test_config(1, 0, 0);
+    started = capture.start();
+    stopped = capture.stop();
+    Ok(
+        started == 0 && stopped == -90001 && !capture.closed() && !capture.active()
+    )
+}
+
+main = (env: Env) Res<i32, AllocError> {
+    arena ::= env.mem.alloc();
+    capture = Capture.create(arena).try();
+    Faults.test_config(0, 1, 0);
+    good ::= capture.start() == CAPTURE_ALLOCATION_FAILED && capture.closed() && Faults.test_tokens() == 0 && Faults.test_creates() == 0;
+    Faults.test_config(0, 0, 1);
+    good = good && capture.start() == -90002 && capture.closed() && Faults.test_tokens() == 0;
+    Faults.test_config(1, 0, 0);
+    good    = good && capture.start() == 0 && Faults.test_tokens() == 1;
+    good    = good && capture.stop() == -90001 && !capture.closed() && !capture.active();
+    good    = good && Faults.test_user().to<Ptr<State>>().read(0).is_null();
+    creates = Faults.test_creates();
+    good    = good && capture.start() == -90001 && Faults.test_creates() == creates && Faults.test_tokens() == 1;
+    // Any access to the null buffer would crash: detached callback must return.
+    input_callback(
+        Faults.test_user(),
+        null_ptr<()>(),
+        null_ptr<()>(),
+        null_ptr<()>(),
+        0,
+        null_ptr<()>()
+    );
+    Faults.test_config(0, 0, 0);
+    good = good && capture.stop() == 0 && capture.closed() && Faults.test_tokens() == 0;
+    good = good && capture.stop() == 0 && Faults.test_tokens() == 0;
+    good = good && capture.start() == 0 && capture.stop() == 0 && Faults.test_tokens() == 0;
+    good = good && quarantine(env).try();
+    // quarantine's arena is gone; callback still must not dereference it.
+    input_callback(
+        Faults.test_user(),
+        null_ptr<()>(),
+        null_ptr<()>(),
+        null_ptr<()>(),
+        0,
+        null_ptr<()>()
+    );
+    good = good && Faults.test_tokens() == 1;
+    // The fixture owns this fake queue: release the deliberately retained token.
+    CallbackMemory.free(Faults.test_user());
+    println(
+        "capture disposal failure, retry, repeated close, allocation failure and late callback {}",
+        good
+    );
+    Ok(good.match({true => 0, false => 1}))
+}

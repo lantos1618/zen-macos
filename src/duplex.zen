@@ -1,0 +1,89 @@
+// Platform-owned capture/output; methods run on the creating main runloop.
+// The allocator must survive stop(). Never send this object to a worker actor.
+Alloc, AllocError, Ptr, null_ptr = std.mem
+Capture, Recording = macos.audio
+Playback = macos.voice_output
+class, selector, text = macos.objc
+PermissionCall = c.bind("objc/message.h", "objc_msgSend", {
+    status* = (receiver: Ptr<()>, method: Ptr<()>, media: Ptr<()>) i64
+})
+PERMISSION_DENIED*: i32 = -70202
+PLATFORM_ERROR*: i32 = -70201
+PACKET_SAMPLES*: usize = 320
+SAMPLE_RATE*: u32 = 16000
+Duplex* = {
+    capture: Capture,
+    playback: Playback,
+    code: Ptr<i32>,
+    permission_device: Ptr<()>, permission_method: Ptr<()>, permission_media: Ptr<()>,
+
+    create* = (a: Alloc) Res<Duplex, AllocError> {
+        permission_device = class(a, "AVCaptureDevice").try();
+        permission_method = selector(a, "authorizationStatusForMediaType:").try();
+        permission_media = text(a, "soun").try();
+        capture = Capture.create(a).try();
+        playback = Playback.create(a).try();
+        code = a.realloc<i32>(null_ptr<i32>(), 1).try();
+        code.write(0, 0);
+        Ok(Duplex(permission_device: permission_device, permission_method: permission_method, permission_media: permission_media, capture: capture, playback: playback, code: code))
+    }
+
+    start* = (self: @Self, a: Alloc) bool {
+        self.active().match({
+            true => true,
+            false => {
+                ready ::= self.stop(a);
+                self.code.write(0, 0);
+                
+                (ready && self.capture.continuous(true)).match({
+                    true => {
+                        output = self.playback.start();
+                        self.code.write(0, output);
+                        (output == 0).then(() { self.code.write(0, self.capture.start()); });
+                        (self.code.read(0) != 0).then(() {
+                            saved = self.code.read(0);
+                            self.stop(a);
+                            self.code.write(0, saved);
+                        });
+                        self.code.read(0) == 0
+                    },
+                    false => { self.code.write(0, PLATFORM_ERROR); false },
+                })
+            },
+        })
+    }
+
+    stop* = (self: @Self, a: Alloc) bool {
+        // Detach callbacks before deactivating the session or releasing storage.
+        input = self.capture.stop();
+        output = self.playback.stop();
+        result ::= (input != 0).match({true => input, false => output});
+        
+        self.code.write(0, result);
+        result == 0
+    }
+
+    tick* = (self: @Self) i32 {
+        // NotDetermined is allowed: first use may be waiting on the OS prompt.
+        // Some launch contexts report it even while samples arrive. Only an
+        // explicit restricted/denied value becomes a permission failure.
+        (self.capture.active() && !self.permission_device.is_null()).then(() {
+            authorization = PermissionCall.status(self.permission_device, self.permission_method, self.permission_media);
+            (authorization == 1 || authorization == 2).then(() {
+                self.code.write(0, PERMISSION_DENIED);
+            });
+        });
+        input = self.capture.poll();
+        output = self.playback.status();
+        (input != 0).then(() { self.code.write(0, input); });
+        (output != 0).then(() { self.code.write(0, output); });
+        self.code.read(0)
+    }
+    samples* = (self: @Self) Recording { self.capture.recording() }
+    discard* = (self: @Self, count: usize) bool { self.capture.discard_prefix(count) }
+    play* = (self: @Self, data: Ptr<f32>) bool { self.playback.enqueue(data, PACKET_SAMPLES) }
+    underruns* = (self: @Self) usize { self.playback.underruns() }
+    buffered* = (self: @Self) usize { self.playback.buffered_packets() }
+    status* = (self: @Self) i32 { self.code.read(0) }
+    active* = (self: @Self) bool { self.capture.active() && self.playback.active() && self.code.read(0) == 0 }
+}

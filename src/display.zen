@@ -3,7 +3,7 @@
 Clock = c.bind("QuartzCore/QuartzCore.h", {
     CACurrentMediaTime* = () f64
 })
-Alloc, AllocError = std.mem
+Alloc, AllocError, Ptr, null_ptr = std.mem
 Samples, Summary = std.stats
 round = std.math
 
@@ -16,6 +16,13 @@ FrameRate* = {
     previous :: f64,
     count :: i32,
     intervals :: Samples,
+    ends :: Ptr<f64>,
+    durations :: Ptr<f64>,
+    retained :: usize,
+    next :: usize,
+    first :: f64,
+    avg_1s_hz* :: f64,
+    avg_3s_hz* :: f64,
     value* :: f64,
     p50_ms* :: f64,
     p95_ms* :: f64,
@@ -27,6 +34,13 @@ FrameRate* = {
             previous: 0.0,
             count: 0,
             intervals: Samples.create(a, 240).try(),
+            ends: a.realloc<f64>(null_ptr<f64>(), 2048).try(),
+            durations: a.realloc<f64>(null_ptr<f64>(), 2048).try(),
+            retained: 0,
+            next: 0,
+            first: 0.0,
+            avg_1s_hz: 0.0,
+            avg_3s_hz: 0.0,
             value: 0.0,
             p50_ms: 0.0,
             p95_ms: 0.0,
@@ -35,16 +49,32 @@ FrameRate* = {
     }
 
     submitted* = (self :: @Self) bool {
-        now = monotonic();
+        self.submitted_at(monotonic())
+    }
+
+    // Explicit timestamps also permit deterministic pacing tests.
+    submitted_at* = (self :: @Self, now: f64) bool {
         (self.previous > 0.0).then(() {
-            self.intervals.record((now - self.previous) * 1000.0);
+            self.count = self.count + 1;
+            duration = now - self.previous;
+            self.intervals.record(duration * 1000.0);
+            self.ends.write(self.next, now);
+            self.durations.write(self.next, duration);
+            self.next = (self.next + 1) % 2048;
+            (self.retained < 2048).then(
+                () { self.retained = self.retained + 1; }
+            );
         });
+        (self.previous == 0.0).then(() { self.first = now; self.start = now; });
         self.previous = now;
-        self.count    = self.count + 1;
         elapsed       = now - self.start;
         (elapsed >= 0.5).match({
             true  => {
-                self.value = round(self.count.to_f64() / elapsed * 10.0) / 10.0;
+                self.avg_1s_hz = self.average(now, 1.0);
+                self.avg_3s_hz = self.average(now, 3.0);
+                self.value     = round(
+                    self.count.to_f64() / elapsed * 10.0
+                ) / 10.0;
                 self.intervals.summary().match({
                     Ok(summary) => {
                         self.p50_ms = round(summary.p50 * 100.0) / 100.0;
@@ -60,4 +90,29 @@ FrameRate* = {
             false => false,
         })
     }
+    // Boundary intervals count proportionally; startup uses available history.
+    // 2048 intervals cover over 3 seconds at 600 Hz, with no per-frame allocation.
+    average = (self: @Self, now: f64, seconds: f64) f64 {
+        beginning ::= now - seconds;
+        (beginning < self.first).then(() { beginning = self.first; });
+        (self.retained == 2048).then(() {
+            oldest = self.ends.read(self.next) - self.durations.read(self.next);
+            (beginning < oldest).then(() { beginning = oldest; });
+        });
+        frames ::= 0.0;
+        Range(0, self.retained).loop((i) {
+            end      = self.ends.read(i);
+            duration = self.durations.read(i);
+            (end > beginning && duration > 0.0).then(() {
+                start ::= end - duration;
+                (start < beginning).then(() { start = beginning; });
+                frames = frames + (end - start) / duration;
+            });
+        });
+        (now > beginning).match({
+            true  => round(frames / (now - beginning) * 10.0) / 10.0,
+            false => 0.0,
+        })
+    }
+
 }

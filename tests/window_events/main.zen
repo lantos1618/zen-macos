@@ -1,3 +1,4 @@
+Deadline = c.bind("unistd.h", { alarm* = (seconds: u32) u32 })
 CloseRequests = macos.window_events
 Runtime, Message, Rect, Point, Size = macos.native
 class, selector, object, create = macos.objc
@@ -5,6 +6,8 @@ Call = c.bind("objc/message.h", "objc_msgSend", {
     close* = (receiver: Ptr<()>, method: Ptr<()>, window: Ptr<()>) bool
 })
 main = (env: Env) Res<i32, AllocError> {
+    // Bound the native regression even when run outside a test harness.
+    Deadline.alarm(15);
     a           = env.mem.alloc();
     pool        = create(a, "NSAutoreleasePool").try();
     release     = selector(a, "release").try();
@@ -50,5 +53,6 @@ main = (env: Env) Res<i32, AllocError> {
     Message.void(window, selector(a, "close").try());
     Message.void(window, release); Message.void(pool, release);
     println("window close interception and repeated cleanup: {}", good);
+    Deadline.alarm(0);
     Ok(good.match({true => 0, false => 1}))
 }

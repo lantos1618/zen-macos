@@ -1,0 +1,56 @@
+// Appended to the real voice_output.zen; exercises private ring state without opening audio.
+main = (env: Env) Res<i32, AllocError> {
+    a = env.mem.alloc();
+    playback = Playback.create(a).try();
+    input = a.realloc<f32>(null_ptr<f32>(), PACKET_SAMPLES).try();
+    output = a.realloc<f32>(null_ptr<f32>(), PACKET_SAMPLES).try();
+    Range(0, PACKET_SAMPLES).loop((i) { input.write(i, 0.5); });
+    state ::= playback.state.read(0).playout;
+    good ::= !state.push(input, 1) && !state.push(null_ptr<f32>(), PACKET_SAMPLES);
+    Range(0, 3).loop((i) { good = good && state.push(input, PACKET_SAMPLES); });
+    state.render(output);
+    good = good && state.count == 3 && state.buffering && state.underruns == 0;
+    Range(0, PACKET_SAMPLES).loop((i) { good = good && output.read(i) == 0.0; });
+    good = good && state.push(input, PACKET_SAMPLES);
+    state.render(output);
+    good = good && !state.buffering && state.count == 3 && output.read(0) == 0.0;
+    good = good && output.read(79) > 0.499 && output.read(79) < 0.501 && output.read(319) == 0.5;
+    Range(0, 3).loop((i) { state.render(output); });
+    good = good && state.count == 0;
+    state.render(output);
+    good = good && state.buffering && state.underruns == 1;
+    good = good && output.read(0) == 0.5 && output.read(79) == 0.0 && output.read(319) == 0.0;
+    state.render(output);
+    good = good && state.underruns == 1 && output.read(0) == 0.0;
+    // Recovery waits for a complete prefill and ramps nonzero input from zero.
+    Range(0, 3).loop((i) { good = good && state.push(input, PACKET_SAMPLES); });
+    state.render(output);
+    good = good && state.buffering && state.count == 3 && output.read(319) == 0.0;
+    good = good && state.push(input, PACKET_SAMPLES);
+    state.render(output);
+    good = good && output.read(0) == 0.0 && output.read(40) > 0.24 && output.read(40) < 0.27;
+    good = good && output.read(319) == 0.5 && state.underruns == 1;
+    Range(0, 3).loop((i) { state.render(output); });
+    state.render(output);
+    good = good && state.underruns == 2;
+    before_wrap = state.head;
+    // Fill through ring wrap, overflow must not overwrite pending samples.
+    value: f32 ::= 0.0;
+    Range(0, JITTER_PACKETS).loop((packet) {
+        Range(0, PACKET_SAMPLES).loop((i) { input.write(i, value); });
+        good = good && state.push(input, PACKET_SAMPLES);
+        value = value + 1.0;
+    });
+    good = good && !state.push(input, PACKET_SAMPLES) && state.dropped == 1;
+    value = 0.0;
+    Range(0, JITTER_PACKETS).loop((packet) {
+        state.render(output);
+        good = good && output.read(319) == value;
+        value = value + 1.0;
+    });
+    good = good && state.count == 0 && state.head == before_wrap;
+    // Reach native start/output paths for compilation without audio access.
+    (playback.status() == 100).then(() { playback.start(); playback.enqueue(input, PACKET_SAMPLES); });
+    good = good && playback.stop() == 0;
+    Ok(good.match({true => 0, false => 1}))
+}

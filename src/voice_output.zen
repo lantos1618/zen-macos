@@ -1,0 +1,200 @@
+// Main-run-loop-owned bounded PCM output. All calls, including stop, belong to
+// the creating UI thread. Do not copy a live Playback; stop before arena reset.
+Alloc, AllocError, Ptr, null_ptr = std.mem
+callback = std.native
+Playout, PACKET_SAMPLES*, JITTER_PACKETS*, PREFILL_PACKETS*, FADE_SAMPLES* = audio.playout
+BUFFER_COUNT*: usize = 3
+OUTPUT_ALLOCATION_FAILED*: i32 = -70101
+OUTPUT_NOT_RUNNING*: i32 = -70102
+
+Format = {
+    rate: f64, format: u32, flags: u32, bytes_per_packet: u32,
+    frames_per_packet: u32, bytes_per_frame: u32, channels: u32,
+    bits: u32, reserved: u32,
+}
+Buffer = { capacity: u32, data: Ptr<f32>, size :: u32 }
+RunLoop = c.bind("CoreFoundation/CoreFoundation.h", {
+    CFRunLoopGetCurrent* = () Ptr<()>
+})
+NewOutput = c.bind("AudioToolbox/AudioToolbox.h", "AudioQueueNewOutput", {
+    create* = (format: Ptr<Format>, callback: Ptr<()>, user: Ptr<()>, loop: Ptr<()>, mode: Ptr<()>, flags: u32, output: Ptr<Ptr<()>>) i32
+})
+AllocateBuffer = c.bind("AudioToolbox/AudioToolbox.h", "AudioQueueAllocateBuffer", {
+    allocate* = (queue: Ptr<()>, size: u32, output: Ptr<Ptr<()>>) i32
+})
+Queue = c.bind("AudioToolbox/AudioToolbox.h", {
+    AudioQueueEnqueueBuffer* = (queue: Ptr<()>, buffer: Ptr<()>, packets: u32, descriptions: Ptr<()>) i32
+    AudioQueueStart* = (queue: Ptr<()>, time: Ptr<()>) i32
+    AudioQueueStop* = (queue: Ptr<()>, immediate: bool) i32
+    AudioQueueDispose* = (queue: Ptr<()>, immediate: bool) i32
+})
+// Only this detached callback token uses native allocation. If disposal fails,
+// callbacks may outlive the caller's allocator. Retain the inert token until a
+// later stop succeeds, matching capture's callback lifetime policy.
+CallbackMemory = c.bind("stdlib.h", {
+    malloc* = (size: usize) Ptr<()>
+    free* = (memory: Ptr<()>) ()
+})
+// Three hardware buffers continuously cycle after an 80ms startup prefill.
+// The bounded packet ring absorbs arrival jitter independently of hardware
+// ownership. Underflow refills with silence and waits for another prefill.
+State = {
+    buffers: Ptr<Ptr<()>>, playout :: Playout, running :: bool,
+    started :: bool, error :: i32,
+}
+
+output_callback = (user: Ptr<()>, queue: Ptr<()>, returned: Ptr<()>) () {
+    state_ptr = user.to<Ptr<State>>().read(0);
+    (!state_ptr.is_null()).then(() {
+        state ::= state_ptr.read(0);
+        (state.running && state.error == 0).then(() {
+            buffer ::= returned.to<Buffer>().read(0);
+            state.playout.render(buffer.data);
+            buffer.size = 1280;
+            returned.to<Buffer>().write(0, buffer);
+            state.error = Queue.AudioQueueEnqueueBuffer(queue, returned, 0, null_ptr<()>());
+            state_ptr.write(0, state);
+        });
+    });
+}
+Playback* = {
+    state: Ptr<State>, format: Ptr<Format>, queue: Ptr<Ptr<()>>,
+    context: Ptr<Ptr<()>>,
+
+    create* = (a: Alloc) Res<Playback, AllocError> {
+        buffers = a.realloc<Ptr<()>>(null_ptr<Ptr<()>>(), BUFFER_COUNT).try();
+        ring = a.realloc<f32>(null_ptr<f32>(), JITTER_PACKETS * PACKET_SAMPLES).try();
+        state = a.realloc<State>(null_ptr<State>(), 1).try();
+        format = a.realloc<Format>(null_ptr<Format>(), 1).try();
+        queue = a.realloc<Ptr<()>>(null_ptr<Ptr<()>>(), 1).try();
+        context = a.realloc<Ptr<()>>(null_ptr<Ptr<()>>(), 1).try();
+        Range(0, BUFFER_COUNT).loop((i) {
+            buffers.write(i, null_ptr<()>());
+        });
+        state.write(0, State(buffers: buffers, playout: Playout(ring: ring), running: false,
+            started: false, error: 0));
+        format.write(0, Format(rate: 16000.0, format: 1819304813, flags: 9,
+            bytes_per_packet: 4, frames_per_packet: 1, bytes_per_frame: 4,
+            channels: 1, bits: 32, reserved: 0));
+        queue.write(0, null_ptr<()>());
+        context.write(0, null_ptr<()>());
+        Ok(Playback(state: state, format: format, queue: queue, context: context))
+    }
+
+    start* = (self: @Self) i32 {
+        self.queue.read(0).is_null().match({
+            false => self.active().match({true => self.status(), false => OUTPUT_NOT_RUNNING}),
+            true => {
+                state ::= self.state.read(0);
+                state.error = 0;
+                state.playout.reset();
+                state.started = false;
+                state.running = false;
+                Range(0, BUFFER_COUNT).loop((i) {
+                    state.buffers.write(i, null_ptr<()>());
+                });
+                self.state.write(0, state);
+                token = CallbackMemory.malloc(null_ptr<Ptr<State>>().bytes(1));
+                self.context.write(0, token);
+                result ::= OUTPUT_ALLOCATION_FAILED;
+                (!token.is_null()).then(() {
+                    token.to<Ptr<State>>().write(0, self.state);
+                    result = NewOutput.create(self.format, callback(output_callback),
+                        token, RunLoop.CFRunLoopGetCurrent(), null_ptr<()>(), 0, self.queue);
+                });
+                (result == 0).then(() {
+                    Range(0, BUFFER_COUNT).loop((i) {
+                        (result == 0).then(() {
+                            result = AllocateBuffer.allocate(self.queue.read(0), 1280,
+                                state.buffers.offset(i));
+                        });
+                    });
+                });
+                (result == 0).match({
+                    true => {
+                        state.running = true;
+                        self.state.write(0, state);
+                    },
+                    false => {
+                        self.stop();
+                        failed ::= self.state.read(0);
+                        failed.error = result;
+                        self.state.write(0, failed);
+                    },
+                });
+                result
+            },
+        })
+    }
+
+    // Copies one 20ms packet into the bounded jitter ring. A full ring drops
+    // newest input; accepted packets are never overwritten while pending.
+    enqueue* = (self: @Self, data: Ptr<f32>, count: usize) bool {
+        state ::= self.state.read(0);
+        (state.running && state.error == 0).match({
+            false => false,
+            true => {
+                accepted = state.playout.push(data, count);
+                (accepted && !state.started && state.playout.count >= PREFILL_PACKETS).then(() {
+                    Range(0, BUFFER_COUNT).loop((i) {
+                        (state.error == 0).then(() {
+                            native = state.buffers.read(i);
+                            buffer ::= native.to<Buffer>().read(0);
+                            state.playout.render(buffer.data);
+                            buffer.size = 1280;
+                            native.to<Buffer>().write(0, buffer);
+                            state.error = Queue.AudioQueueEnqueueBuffer(self.queue.read(0), native, 0, null_ptr<()>());
+                        });
+                    });
+                    (state.error == 0).then(() {
+                        state.error = Queue.AudioQueueStart(self.queue.read(0), null_ptr<()>());
+                        state.started = state.error == 0;
+                    });
+                });
+                self.state.write(0, state);
+                accepted && state.error == 0
+            },
+        })
+    }
+
+    stop* = (self: @Self) i32 {
+        state ::= self.state.read(0);
+        state.running = false;
+        state.started = false;
+        self.state.write(0, state);
+        token = self.context.read(0);
+        (!token.is_null()).then(() { token.to<Ptr<State>>().write(0, null_ptr<State>()); });
+        queue = self.queue.read(0);
+        queue.is_null().match({
+            true => {
+                CallbackMemory.free(token);
+                self.context.write(0, null_ptr<()>());
+                0
+            },
+            false => {
+                stopped = Queue.AudioQueueStop(queue, true);
+                disposed = Queue.AudioQueueDispose(queue, true);
+                (disposed == 0).match({
+                    true => {
+                        self.queue.write(0, null_ptr<()>());
+                        CallbackMemory.free(token);
+                        self.context.write(0, null_ptr<()>());
+                    },
+                    false => {
+                        failed ::= self.state.read(0);
+                        failed.error = disposed;
+                        self.state.write(0, failed);
+                    },
+                });
+                (disposed == 0).match({true => stopped, false => disposed})
+            },
+        })
+    }
+    active* = (self: @Self) bool { self.state.read(0).running }
+    status* = (self: @Self) i32 { self.state.read(0).error }
+    dropped* = (self: @Self) usize { self.state.read(0).playout.dropped }
+    // Underflow transitions, excluding startup and sustained silent refill.
+    underruns* = (self: @Self) usize { self.state.read(0).playout.underruns }
+    buffered_packets* = (self: @Self) usize { self.state.read(0).playout.count }
+    closed* = (self: @Self) bool { self.queue.read(0).is_null() }
+}

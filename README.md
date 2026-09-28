@@ -208,8 +208,20 @@ bounded buffers but does not start recording. `start()` is an explicit user
 action; `stop()` disposes the queue. Call `poll()` during event processing to
 stop on callback failure or the default bounded 30-second limit. `samples(out)`
 copies the latest 1024 mono samples; `recording()` borrows up to 30 seconds of
-16 kHz float32 audio until the next recording or prefix discard. Keep the allocator alive until
-`closed()` confirms queue disposal. A live Capture must not be copied.
+16 kHz float32 audio until the next recording or prefix discard. Keep the allocator
+alive through `stop()`. Callback access to arena state is detached before native
+shutdown, so releasing that arena afterward is safe even if disposal fails.
+`closed()` confirms native queue disposal. A failed disposal retains an inert,
+pointer-sized native callback token and the native queue; retry `stop()` while
+the Capture arena remains alive to reclaim them. Restart is refused until cleanup
+succeeds. Permanent failures intentionally quarantine those native resources until
+process exit. `CAPTURE_ALLOCATION_FAILED` (`-70002`) reports token allocation failure.
+Callbacks and all Capture operations must run on the creating main CFRunLoop;
+this is serialized ownership, not atomic cross-thread access. A live Capture must
+not be copied.
+
+`python3 tests/audio/run_disposal.py` tests native failure paths without accessing
+the microphone. `--negative-control` confirms missing callback detachment fails.
 
 The app bundle declares `NSMicrophoneUsageDescription`. macOS controls access;
 first recording attempts can prompt, and a denial must be changed in System
@@ -320,12 +332,28 @@ and pending drawable, before the caller may free the allocator. Lifecycle calls,
 `tick`, capture reads and all native UI operations must stay on the main thread.
 Inference belongs to a separate library's worker actor and returns copied data.
 
-The overlay reports submission FPS and p95/p99 **submission intervals**, using a
-bounded portable statistics buffer. These are neither GPU durations nor measured
-display-presented frame intervals. `display_link()`, `display_updates()` and
+The voice overlay displays host-supplied three-second mean/min/max pitch and
+simple deep/mid/high bands; pitch detection belongs to `zen-audio`, not the
+native SDK. The display timing tracker retains rolling 1/3-second submission
+rates and p95/p99 submission intervals. These measure neither GPU durations
+nor actual presentation. The native `tests/display` executable checks steady
+rates, wraparound, rate changes and stalls with deterministic timestamps.
+`display_link()`, `display_updates()` and
 `coalesced_updates()` expose scheduler diagnostics. A coalesced update means a
 new callback replaced a drawable not yet consumed by a tick, not a measured
 missed presentation deadline. No per-frame network telemetry is emitted.
+
+Run the display and hidden-window close-delegate regressions through Zen's
+native executable test runner (from this repository):
+
+```sh
+ZEN_STD=../zen/src CFLAGS='-O2 -Wno-parentheses-equality' ../zen/zen test tests/display
+ZEN_STD=../zen/src CFLAGS='-O2 -Wno-parentheses-equality' ../zen/zen test tests/window_events
+```
+
+Both executables enforce a 15-second runtime deadline with the macOS `alarm`
+API. Build artifacts stay under ignored `build/`; CI should separately enforce
+a build timeout (the former Python wrappers used 120 seconds).
 
 Desktop regression (three 120-frame link lifecycles, repeated closes, and
 link-free deadline fallback):
@@ -345,3 +373,10 @@ Construction cleans up its current native handles on allocation failure. The
 ownership regression checks allocation failures and repeated closes; it is not
 a native heap leak audit. See [desktop validation](docs/PERFORMANCE.md) for
 measured lifecycle, pacing and trace results, including unresolved limitations.
+
+## Camera and voice-processing APIs
+
+Initial `macos.camera` and `macos.voice_processing` APIs expose camera discovery,
+a permission-gated preview session, microphone-mode queries and stopped-engine
+voice-processing configuration. See [native media status](docs/MEDIA.md) for
+ownership rules, test results and the remaining live-capture integration work.

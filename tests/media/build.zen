@@ -1,0 +1,12 @@
+Builder, BuildError = std.build
+build = (b :: Builder) Res<(), BuildError> {
+    platform = b.lib(
+        "macos",
+        {src: Path("../../src/macos.zen"), libs: ["objc"], paths: []}
+    ).try();
+    b.exe(
+        "media-probe",
+        {src: Path("main.zen"), deps: [platform], language: "objective-c", frameworks: ["Foundation", "AVFoundation", "AVFAudio", "QuartzCore"], out: Ok(Path("../../build/media-probe"))}
+    ).try();
+    Ok(())
+}

@@ -1,0 +1,50 @@
+// OS voice-processing controls. These do not modify audio.Capture/AudioQueue.
+// Engine pointers must be valid AVAudioEngine instances, owned by the caller.
+Ptr, null_ptr = std.mem
+class, selector, object = macos.objc
+Message = macos.native
+Mode* = Standard | WideSpectrum | VoiceIsolation | Unavailable
+Modes* = { preferred*: Mode, active*: Mode }
+Error* = InvalidEngine | Running | Unsupported | NativeRejected
+Calls = c.bind("objc/message.h", "objc_msgSend", {
+    responds* = (receiver: Ptr<()>, method: Ptr<()>, selector: Ptr<()>) bool
+    enable* = (receiver: Ptr<()>, method: Ptr<()>, enabled: bool, error: Ptr<Ptr<()>>) bool
+})
+mode = (raw: u64) Mode {
+    raw.match({0 => Mode.Standard, 1 => Mode.WideSpectrum, 2 => Mode.VoiceIsolation, _ => Mode.Unavailable})
+}
+// Read-only: the user selects microphone modes in Control Center. Preferred
+// and active can differ depending on the current audio route.
+microphone_modes* = (a: Alloc) Res<Modes, AllocError> {
+    device    = class(a, "AVCaptureDevice").try();
+    responds  = selector(a, "respondsToSelector:").try();
+    preferred = selector(a, "preferredMicrophoneMode").try();
+    active    = selector(a, "activeMicrophoneMode").try();
+    supported = !device.is_null() && Calls.responds(device, responds, preferred) && Calls.responds(device, responds, active);
+    supported.match({
+        true  => Ok(Modes(
+            preferred: mode(Message.integer(device, preferred)),
+            active: mode(Message.integer(device, active))
+        )),
+        false => Ok(Modes(
+            preferred: Mode.Unavailable,
+            active: Mode.Unavailable
+        )),
+    })
+}
+// Configure before starting a device-rendering engine, on its serialized owner.
+// Apple switches both I/O nodes together. This is not a Voice Isolation setter.
+// Returns explicit failure; no silent fallback to untreated capture.
+set_enabled* = (a: Alloc, engine: Ptr<()>, enabled: bool) Res<(), AllocError
+    | Error> {
+    (!engine.is_null()).ensure(Error.InvalidEngine).try();
+    (!Message.boolean(engine, selector(a, "isRunning").try())).ensure(Error.Running).try();
+    node = object(a, engine, "inputNode").try();
+    (!node.is_null()).ensure(Error.Unsupported).try();
+    method = selector(a, "setVoiceProcessingEnabled:error:").try();
+    Calls.responds(node, selector(a, "respondsToSelector:").try(), method).ensure(Error.Unsupported).try();
+    error = a.realloc<Ptr<()>>(null_ptr<Ptr<()>>(), 1).try();
+    @scope.defer(() { a.free(error); });
+    error.write(0, null_ptr<()>());
+    Calls.enable(node, method, enabled, error).ensure(Error.NativeRejected)
+}

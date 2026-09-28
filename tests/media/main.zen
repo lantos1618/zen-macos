@@ -1,0 +1,54 @@
+Permission, PreviewSession, Error = macos.camera
+permission, available = macos.camera
+set_enabled, microphone_modes = macos.voice_processing
+Ptr, null_ptr = std.mem
+create, selector = macos.objc
+Message = macos.native
+main = (env: Env) Res<i32, AllocError | Error> {
+    a       = env.mem.alloc();
+    release = selector(a, "release").try();
+    pool    = create(a, "NSAutoreleasePool").try();
+    @scope.defer(() { Message.void(pool, release); });
+    authorization = permission(a).try();
+    has_camera    = available(a).try();
+    modes         = microphone_modes(a).try();
+    label         = authorization.match({NotDetermined => "not determined", Restricted => "restricted", Denied => "denied", Authorized => "authorized", Unavailable => "unavailable"});
+    println("Camera available: {}; permission: {}", has_camera, label);
+    println(
+        "Microphone modes available: preferred {}, active {}",
+        modes.preferred.match({Unavailable => false, _ => true}),
+        modes.active.match({Unavailable => false, _ => true})
+    );
+    invalid = set_enabled(
+        a,
+        null_ptr<()>(),
+        true
+    ).match({Ok(_) => false, Err(error) => true});
+    invalid.ensure(Error.NativeFailed).try();
+    authorization.match({Authorized => (), _ => {
+        rejected = PreviewSession.create(a).match({
+            Ok(session) => { session.close(); false },
+            Err(error)  => error.match({Error.PermissionRequired => true, _ => false}),
+        });
+        rejected.ensure(Error.NativeFailed).try();
+        println("Unauthorized camera creation rejected without capture: PASS");
+    }});
+    // Default probe never starts capture. Optional lifecycle test needs an
+    // already-authorized app identity and does not save or transmit frames.
+    env.argv.find(
+        (arg) { arg.eq("--camera-lifecycle") }
+    ).match({None => (), Ok(_) => {
+        session = PreviewSession.create(a).try();
+        @scope.defer(() { session.close(); });
+        alias = session;
+        session.start().try();
+        session.active().ensure(Error.NativeFailed).try();
+        session.close(); alias.close();
+        (!alias.active() && alias.layer().is_null()).ensure(
+            Error.NativeFailed
+        ).try();
+        println("Camera session start and copied-handle close: PASS");
+    }});
+    println("Media capability probe and invalid-engine guard: PASS");
+    Ok(0)
+}

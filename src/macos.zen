@@ -25,15 +25,21 @@ frame = (width: f64, height: f64) Rect {
 // Text is borrowed and must outlive the app and its run loop.
 Config* = {
     title*: str,
+    width* :: f64 = 960.0,
+    height* :: f64 = 600.0,
+    minimum_width* :: f64 = 360.0,
+    minimum_height* :: f64 = 240.0,
     heading*: str,
     description*: str,
     prompt*: str,
     greeting*: str,
     spectrum_label* :: str = "FFT",
+    show_voice_pitch* :: bool = true,
     // Optional rolling excerpt for long input; the full input buffer is retained.
     input_tail_bytes* :: usize = 0,
     // Forward editing keys to the host; F2 still controls allowed capture.
     editable* :: bool = false,
+    custom_content* :: bool = false,
 }
 
 App* = {
@@ -51,6 +57,9 @@ App* = {
     microphone*: Capture,
     microphone_error :: i32,
     notice :: str,
+    voice_mean :: f64,
+    voice_low :: f64,
+    voice_high :: f64,
     device :: Ptr<()>,
     queue :: Ptr<()>,
     speech :: Ptr<()>,
@@ -65,6 +74,15 @@ App* = {
     keyboard: Ptr<u8>,
     pending_key :: Res<KeyEvent>,
     close_requests :: Res<CloseRequests>,
+
+    content_layer* = (self: @Self) Ptr<()> { self.layer }
+    content_view* = (self: @Self) Ptr<()> { self.view }
+    content_bounds* = (self: @Self, a: Alloc) Res<Rect, AllocError> {
+        Ok(Message.rect(self.view, selector(a, "bounds").try()))
+    }
+    content_scale* = (self: @Self, a: Alloc) Res<f64, AllocError> {
+        Ok(Message.scalar(self.window, selector(a, "backingScaleFactor").try()))
+    }
 
     submission_fps* = (self: @Self) f64 { self.rate.value }
     interval_p95_ms* = (self: @Self) f64 { self.rate.p95_ms }
@@ -110,6 +128,9 @@ App* = {
             microphone: microphone,
             microphone_error: 0,
             notice: "",
+            voice_mean: 0.0,
+            voice_low: 0.0,
+            voice_high: 0.0,
             device: null_ptr<()>(),
             queue: null_ptr<()>(),
             speech: null_ptr<()>(),
@@ -160,7 +181,7 @@ App* = {
         window               = Message.window(
             allocated,
             initialize_window,
-            frame(960.0, 600.0),
+            frame(self.config.width, self.config.height),
             15,
             2,
             false
@@ -175,7 +196,7 @@ App* = {
         Message.set_size(
             window,
             selector(a, "setContentMinSize:").try(),
-            Size(width: 360.0, height: 240.0)
+            Size(width: self.config.minimum_width, height: self.config.minimum_height)
         );
         Message.set_object(
             window,
@@ -251,6 +272,24 @@ App* = {
         });
         speech      = create(a, "AVSpeechSynthesizer").try();
         self.speech = speech;
+        self.config.custom_content.then(() {
+            Message.set_bool(
+                self.layer,
+                selector(a, "setGeometryFlipped:").try(),
+                true
+            );
+            Message.set_bool(
+                self.text_layer,
+                selector(a, "setHidden:").try(),
+                true
+            );
+            Message.set_bool(
+                self.status_layer,
+                selector(a, "setHidden:").try(),
+                true
+            );
+            Range(0, 32).loop((i) { Message.set_bool(self.bars.read(i), selector(a, "setHidden:").try(), true); });
+        });
         self.pacer.start(a, self.layer).try();
         self.refresh(a).try();
         Ok(())
@@ -282,6 +321,9 @@ App* = {
     }
 
     refresh = (self: @Self, a: Alloc) Res<(), AllocError> {
+        // Callers can refresh outside tick; bound native temporary lifetimes too.
+        refresh_pool = create(a, "NSAutoreleasePool").try();
+        @scope.defer(() { Message.void(refresh_pool, self.release); });
         transaction = class(a, "CATransaction").try();
         commit      = selector(a, "commit").try();
         Message.void(transaction, selector(a, "begin").try());
@@ -312,11 +354,19 @@ App* = {
             selector(a, "setString:").try(),
             text(a, contents.view()).try()
         );
+        pitch  = self.config.show_voice_pitch.match({
+            true  => a.String(
+                "Voice 3s avg {} Hz · low {} · high {} · {}\n",
+                self.voice_mean,
+                self.voice_low,
+                self.voice_high,
+                (self.voice_mean == 0.0).match({true => "no voiced pitch", false => (self.voice_mean < 130.0).match({true => "deep", false => (self.voice_mean < 200.0).match({true => "mid", false => "high"})})})
+            ).try(),
+            false => a.String("").try(),
+        });
         status = a.String(
-            "Submit {} FPS · p95 {} ms · p99 {} ms\nmic {} · {} · code {} · F2 · {}",
-            self.rate.value,
-            self.rate.p95_ms,
-            self.rate.p99_ms,
+            "{}mic {} · {} · code {} · F2 · {}",
+            pitch.view(),
             self.microphone.active().match({true => "ON", false => "off"}),
             capture_permission_text(
                 permission(a).try(),
@@ -586,7 +636,25 @@ App* = {
         (!event.is_null()).then(() {
             kind = Message.integer(event, selector(a, "type").try());
             (kind == 10).match({
-                true  => { keep = self.key(a, event).try(); },
+                true  => {
+                    self.config.custom_content.match({
+                        true  => {
+                            code = Message.keycode(
+                                event,
+                                selector(a, "keyCode").try()
+                            );
+                            (code == 53).match({
+                                true  => { keep = false; },
+                                false => { Message.set_object(
+                                    self.application,
+                                    selector(a, "sendEvent:").try(),
+                                    event
+                                ); },
+                            });
+                        },
+                        false => { keep = self.key(a, event).try(); },
+                    });
+                },
                 false => Message.set_object(
                     self.application,
                     selector(a, "sendEvent:").try(),
@@ -632,6 +700,10 @@ App* = {
     }
 
     // Host application owns DSP and model work between ticks.
+    voice_pitch* = (self :: @Self, mean: f64, low: f64, high: f64) () {
+        self.voice_mean = mean; self.voice_low = low; self.voice_high = high;
+    }
+
     spectrum* = (self: @Self, values: Ptr<f64>) () {
         self.levels.copy_from(values, 32);
     }

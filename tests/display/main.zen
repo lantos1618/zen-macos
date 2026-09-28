@@ -1,0 +1,26 @@
+Deadline = c.bind("unistd.h", { alarm* = (seconds: u32) u32 })
+FrameRate, monotonic = macos.display
+main = (env: Env) Res<i32, AllocError> {
+    // Bound the native regression even when run outside a test harness.
+    Deadline.alarm(15);
+    a = env.mem.alloc();
+    initial ::= FrameRate.create(a).try();
+    initial.submitted_at(10.0);
+    Range(1, 31).loop((i) { initial.submitted_at(10.0 + i.to_u64().to_i32().match({Ok(value) => value.to_f64(), None => 0.0}) / 60.0); });
+    first_good = initial.value == 60.0 && initial.avg_1s_hz == 60.0;
+    rate ::= FrameRate.create(a).try();
+    now  ::= 10.0;
+    rate.submitted_at(now);
+    Range(0, 2400).loop((i) { now = now + 1.0 / 60.0; rate.submitted_at(now); });
+    good ::= first_good && rate.avg_1s_hz == 60.0 && rate.avg_3s_hz == 60.0;
+    Range(0, 36).loop((i) { now = now + 1.0 / 30.0; rate.submitted_at(now); });
+    good = good && rate.avg_1s_hz < 40.0 && rate.avg_3s_hz > rate.avg_1s_hz;
+    Range(0, 100).loop((i) { now = now + 1.0 / 30.0; rate.submitted_at(now); });
+    good = good && rate.avg_1s_hz == 30.0 && rate.avg_3s_hz == 30.0;
+    now  = now + 4.0;
+    rate.submitted_at(now);
+    good = good && rate.avg_1s_hz < 1.0 && rate.avg_3s_hz < 1.0;
+    println("rolling Hz: steady, wraparound, rate change, stall: {}", good);
+    Deadline.alarm(0);
+    Ok(good.match({true => 0, false => 1}))
+}

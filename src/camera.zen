@@ -1,0 +1,122 @@
+// AVFoundation camera access. No permission prompt or capture during probing.
+// Apple silicon Objective-C ABI, matching macos.native.
+Ptr, null_ptr = std.mem
+class, selector, object, create, text = macos.objc
+Message = macos.native
+Permission* = NotDetermined | Restricted | Denied | Authorized | Unavailable
+Error* = PermissionRequired | NoDevice | NativeFailed | Closed
+Calls = c.bind("objc/message.h", "objc_msgSend", {
+    status* = (receiver: Ptr<()>, method: Ptr<()>, media: Ptr<()>) i64
+    accepts* = (receiver: Ptr<()>, method: Ptr<()>, input: Ptr<()>) bool
+    input* = (receiver: Ptr<()>, method: Ptr<()>, device: Ptr<()>, error: Ptr<Ptr<()>>) Ptr<()>
+})
+permission* = (a: Alloc) Res<Permission, AllocError> {
+    device = class(a, "AVCaptureDevice").try();
+    device.is_null().match({
+        true  => Ok(Permission.Unavailable),
+        false => Ok(Calls.status(
+            device,
+            selector(a, "authorizationStatusForMediaType:").try(),
+            text(a, "vide").try()
+        ).match({
+            0 => Permission.NotDetermined, 1 => Permission.Restricted,
+            2 => Permission.Denied, 3 => Permission.Authorized,
+            _ => Permission.Unavailable,
+        })),
+    })
+}
+available* = (a: Alloc) Res<bool, AllocError> {
+    device = Message.object_arg(
+        class(a, "AVCaptureDevice").try(),
+        selector(a, "defaultDeviceWithMediaType:").try(),
+        text(a, "vide").try()
+    );
+    Ok(!device.is_null())
+}
+// Caller allocator outlives all copies. Close before releasing it. This owns a
+// session and preview layer, not recorded frames. No audio input is installed.
+// Serialize lifecycle operations. start/stop may block: use a dedicated owner,
+// not a UI frame callback. Attach/detach the borrowed layer on the UI thread
+// and detach it before close. Do not mutate a running session concurrently.
+PreviewSession* = {
+    handles: Ptr<Ptr<()>>, release: Ptr<()>, stop: Ptr<()>, start_selector: Ptr<()>, running: Ptr<()>,
+    create* = (a: Alloc) Res<PreviewSession, AllocError | Error> {
+        allowed = permission(a).try().match({Authorized => true, _ => false});
+        allowed.ensure(Error.PermissionRequired).try();
+        PreviewSession.make(a)
+    }
+    // Explicit camera action only; requires NSCameraUsageDescription in the
+    // app bundle. Apple prompts on first AVCaptureDeviceInput creation. Poll
+    // permission before start: pending input may otherwise deliver black frames.
+    request* = (a: Alloc) Res<PreviewSession, AllocError | Error> {
+        allowed = permission(
+            a
+        ).try().match({Authorized => true, NotDetermined => true, _ => false});
+        allowed.ensure(Error.PermissionRequired).try();
+        PreviewSession.make(a)
+    }
+    make = (a: Alloc) Res<PreviewSession, AllocError | Error> {
+        handles = a.realloc<Ptr<()>>(null_ptr<Ptr<()>>(), 2).try();
+        handles.write(0, null_ptr<()>()); handles.write(1, null_ptr<()>());
+        owner = PreviewSession(
+            handles: handles,
+            release: selector(a, "release").try(),
+            stop: selector(a, "stopRunning").try(),
+            start_selector: selector(a, "startRunning").try(),
+            running: selector(a, "isRunning").try()
+        );
+        owner.configure(a).match({Ok(_) => Ok(owner), Err(error) => { owner.close(); Err(error) }})
+    }
+    configure = (self: @Self, a: Alloc) Res<(), AllocError | Error> {
+        device = Message.object_arg(
+            class(a, "AVCaptureDevice").try(),
+            selector(a, "defaultDeviceWithMediaType:").try(),
+            text(a, "vide").try()
+        );
+        (!device.is_null()).ensure(Error.NoDevice).try();
+        errors = a.realloc<Ptr<()>>(null_ptr<Ptr<()>>(), 1).try();
+        errors.write(0, null_ptr<()>());
+        input = Calls.input(
+            class(a, "AVCaptureDeviceInput").try(),
+            selector(a, "deviceInputWithDevice:error:").try(),
+            device,
+            errors
+        );
+        (!input.is_null()).ensure(Error.NativeFailed).try();
+        session = create(a, "AVCaptureSession").try();
+        self.handles.write(0, session);
+        (!session.is_null()).ensure(Error.NativeFailed).try();
+        Calls.accepts(session, selector(a, "canAddInput:").try(), input).ensure(Error.NativeFailed).try();
+        Message.set_object(session, selector(a, "addInput:").try(), input);
+        initialize = selector(a, "initWithSession:").try();
+        allocated  = object(
+            a,
+            class(a, "AVCaptureVideoPreviewLayer").try(),
+            "alloc"
+        ).try();
+        preview    = Message.object_arg(allocated, initialize, session);
+        self.handles.write(1, preview);
+        (!preview.is_null()).ensure(Error.NativeFailed).try();
+        Ok(())
+    }
+    // Borrowed; never release this pointer independently.
+    layer* = (self: @Self) Ptr<()> { self.handles.read(1) }
+    start* = (self: @Self) Res<(), Error> {
+        session = self.handles.read(0);
+        (!session.is_null()).ensure(Error.Closed).try();
+        Message.void(session, self.start_selector);
+        Message.boolean(session, self.running).ensure(Error.NativeFailed)
+    }
+    active* = (self: @Self) bool {
+        session = self.handles.read(0);
+        !session.is_null() && Message.boolean(session, self.running)
+    }
+    close* = (self: @Self) () {
+        session = self.handles.read(0);
+        preview = self.handles.read(1);
+        self.handles.write(0, null_ptr<()>()); self.handles.write(1, null_ptr<()>());
+        (!session.is_null()).then(() { Message.void(session, self.stop); });
+        (!preview.is_null()).then(() { Message.void(preview, self.release); });
+        (!session.is_null()).then(() { Message.void(session, self.release); });
+    }
+}

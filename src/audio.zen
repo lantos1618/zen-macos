@@ -66,6 +66,7 @@ SAMPLE_RATE*: f64 = 16000.0
 RECORDING_CAPACITY*: usize = 480000
 // Continuous capture cannot keep up with its consumer; audio was not retained.
 CAPTURE_OVERFLOW*: i32 = -70001
+CAPTURE_ALLOCATION_FAILED*: i32 = -70002
 
 // A bounded view of the captured prefix, available during capture or after
 // stop. On the main thread, existing prefix samples stay unchanged until the
@@ -104,6 +105,16 @@ Queue = c.bind("AudioToolbox/AudioToolbox.h", {
     AudioQueueStart* = (queue: Ptr<()>, time: Ptr<()>) i32
     AudioQueueStop* = (queue: Ptr<()>, immediate: bool) i32
     AudioQueueDispose* = (queue: Ptr<()>, immediate: bool) i32
+})
+
+// Native callback lifetime can exceed the caller's arena when disposal fails.
+// This pointer-sized token is detached before stopping; only successful disposal
+// proves no future callback can read it and permits release. NewInput explicitly
+// targets the creating main CFRunLoop; callback and detach are serialized there.
+// The token is deliberately non-atomic: cross-thread Capture use is unsupported.
+CallbackMemory = c.bind("stdlib.h", {
+    malloc* = (size: usize) Ptr<()>
+    free* = (memory: Ptr<()>) ()
 })
 
 State = {
@@ -153,32 +164,37 @@ input_callback = (
     packets      : u32,
     descriptions : Ptr<()>
 ) () {
-    state_ptr = user.to<State>();
-    state ::= state_ptr.read(0);
-    state.running.then(() {
-        buffer = incoming.to<Buffer>().read(0);
-        bytes  = (buffer.size <= buffer.capacity).match({true => buffer.size, false => buffer.capacity});
-        count  = bytes.to_usize() / 4;
-        state.append(buffer.data, count);
-        (state.error == 0).then(() {
-            state.error = Queue.AudioQueueEnqueueBuffer(
-                queue,
-                incoming,
-                0,
-                null_ptr<()>()
-            );
+    state_ptr = user.to<Ptr<State>>().read(0);
+    (!state_ptr.is_null()).then(() {
+        state ::= state_ptr.read(0);
+        state.running.then(() {
+            buffer = incoming.to<Buffer>().read(0);
+            bytes  = (buffer.size <= buffer.capacity).match({true => buffer.size, false => buffer.capacity});
+            count  = bytes.to_usize() / 4;
+            state.append(buffer.data, count);
+            (state.error == 0).then(() {
+                state.error = Queue.AudioQueueEnqueueBuffer(
+                    queue,
+                    incoming,
+                    0,
+                    null_ptr<()>()
+                );
+            });
+            state_ptr.write(0, state);
         });
-        state_ptr.write(0, state);
     });
 }
 
-// The allocator owns all state and must outlive stop(). All methods must be
+// The allocator owns sample state and must outlive the call to stop(), even if
+// stop reports failure. Failed disposal retains only an inert native token and
+// queue; a later stop retries cleanup. All methods must be
 // called on the same main thread as create/start. Do not copy a live Capture.
 Capture* = {
     state: Ptr<State>,
     format: Ptr<Format>,
     queue: Ptr<Ptr<()>>,
     buffer: Ptr<Ptr<()>>,
+    context: Ptr<Ptr<()>>,
 
     create* = (a: Alloc) Res<Capture, AllocError> {
         data      = a.realloc<f64>(null_ptr<f64>(), SAMPLE_COUNT).try();
@@ -187,6 +203,8 @@ Capture* = {
         format    = a.realloc<Format>(null_ptr<Format>(), 1).try();
         queue     = a.realloc<Ptr<()>>(null_ptr<Ptr<()>>(), 1).try();
         buffer    = a.realloc<Ptr<()>>(null_ptr<Ptr<()>>(), 1).try();
+        context   = a.realloc<Ptr<()>>(null_ptr<Ptr<()>>(), 1).try();
+        context.write(0, null_ptr<()>());
         state.write(
             0,
             State(
@@ -219,7 +237,13 @@ Capture* = {
         );
         queue.write(0, null_ptr<()>());
         buffer.write(0, null_ptr<()>());
-        Ok(Capture(state: state, format: format, queue: queue, buffer: buffer))
+        Ok(Capture(
+            state: state,
+            format: format,
+            queue: queue,
+            buffer: buffer,
+            context: context
+        ))
     }
 
     // Nonzero samples observed during this capture session, not an OS grant.
@@ -271,15 +295,21 @@ Capture* = {
                 state.error          = 0;
                 state.running        = false;
                 self.state.write(0, state);
-                status ::= NewInput.create(
-                    self.format,
-                    callback(input_callback),
-                    self.state.to<()>(),
-                    RunLoop.CFRunLoopGetCurrent(),
-                    null_ptr<()>(),
-                    0,
-                    self.queue
-                );
+                token = CallbackMemory.malloc(null_ptr<Ptr<State>>().bytes(1));
+                self.context.write(0, token);
+                status ::= CAPTURE_ALLOCATION_FAILED;
+                (!token.is_null()).then(() {
+                    token.to<Ptr<State>>().write(0, self.state);
+                    status = NewInput.create(
+                        self.format,
+                        callback(input_callback),
+                        token,
+                        RunLoop.CFRunLoopGetCurrent(),
+                        null_ptr<()>(),
+                        0,
+                        self.queue
+                    );
+                });
                 (status == 0).then(() {
                     queue = self.queue.read(0);
                     Range(0, 3).loop((i) {
@@ -321,14 +351,26 @@ Capture* = {
         state.running.then(() { state.generation = state.generation + 1; });
         state.running = false;
         self.state.write(0, state);
+        token = self.context.read(0);
+        (!token.is_null()).then(() {
+            token.to<Ptr<State>>().write(0, null_ptr<State>());
+        });
         queue = self.queue.read(0);
         queue.is_null().match({
-            true  => 0,
+            true  => {
+                CallbackMemory.free(token);
+                self.context.write(0, null_ptr<()>());
+                0
+            },
             false => {
                 stopped  = Queue.AudioQueueStop(queue, true);
                 disposed = Queue.AudioQueueDispose(queue, true);
                 (disposed == 0).match({
-                    true  => self.queue.write(0, null_ptr<()>()),
+                    true  => {
+                        self.queue.write(0, null_ptr<()>());
+                        CallbackMemory.free(token);
+                        self.context.write(0, null_ptr<()>());
+                    },
                     false => {
                         failed ::= self.state.read(0);
                         failed.error = disposed;
@@ -353,8 +395,9 @@ Capture* = {
         })
     }
 
-    // A failed dispose keeps the queue reference: callers must not release the
-    // backing allocator until a subsequent stop succeeds or the process exits.
+    // A failed dispose keeps the queue and inert callback token for retry.
+    // Sample arena release is safe after stop returns, regardless of this value.
+    // A permanently failed disposal leaks native resources until process exit.
     closed* = (self: @Self) bool { self.queue.read(0).is_null() }
 
     recording* = (self: @Self) Recording {
