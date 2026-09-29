@@ -17,7 +17,7 @@ FailAfter = {
 }
 
 FailAfter.impl(Alloc, {
-    free = <T>(self: @Self, ptr: Ptr<T>) () { self.base.free(ptr); }
+    free = <T>(self: @Self, ptr: Ptr<T>) { self.base.free(ptr); }
     raw = (self: @Self, size: usize, align: usize)
           Res<Ptr<u8>, AllocError> {
         self.take().match({

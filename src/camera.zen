@@ -111,7 +111,7 @@ PreviewSession* = {
         session = self.handles.read(0);
         !session.is_null() && Message.boolean(session, self.running)
     }
-    close* = (self: @Self) () {
+    close* = (self: @Self) {
         session = self.handles.read(0);
         preview = self.handles.read(1);
         self.handles.write(0, null_ptr<()>()); self.handles.write(1, null_ptr<()>());

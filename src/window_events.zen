@@ -75,7 +75,7 @@ CloseRequests* = {
         self.requested.write(0, false);
         value
     }
-    close* = (self :: @Self) () {
+    close* = (self :: @Self) {
         (!self.delegate.is_null()).then(() {
             Message.set_object(self.window, self.set_delegate, null_ptr<()>());
             Runtime.objc_setAssociatedObject(

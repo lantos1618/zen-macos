@@ -130,7 +130,7 @@ State = {
     received_audio :: bool,
     continuous :: bool,
 
-    append = (self :: @Self, incoming: Ptr<f32>, count: usize) () {
+    append = (self :: @Self, incoming: Ptr<f32>, count: usize) {
         Range(0, count).loop((i) {
             (self.error == 0).then(() {
                 (self.continuous && self.recorded >= RECORDING_CAPACITY).match({
@@ -163,7 +163,7 @@ input_callback = (
     timestamp    : Ptr<()>,
     packets      : u32,
     descriptions : Ptr<()>
-) () {
+) {
     state_ptr = user.to<Ptr<State>>().read(0);
     (!state_ptr.is_null()).then(() {
         state ::= state_ptr.read(0);

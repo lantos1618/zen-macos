@@ -43,7 +43,7 @@ State = {
     started :: bool, error :: i32,
 }
 
-output_callback = (user: Ptr<()>, queue: Ptr<()>, returned: Ptr<()>) () {
+output_callback = (user: Ptr<()>, queue: Ptr<()>, returned: Ptr<()>) {
     state_ptr = user.to<Ptr<State>>().read(0);
     (!state_ptr.is_null()).then(() {
         state ::= state_ptr.read(0);

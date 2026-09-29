@@ -28,7 +28,7 @@ update = (
     method   : Ptr<()>,
     link     : Ptr<()>,
     value    : Ptr<()>
-) () {
+) {
     pointer = Runtime.objc_getAssociatedObject(receiver, receiver).to<State>();
     (!pointer.is_null()).then(() {
         state ::= pointer.read(0);
@@ -175,7 +175,7 @@ Pacer* = {
         self.state.write(0, state);
         result
     }
-    close* = (self :: @Self) () {
+    close* = (self :: @Self) {
         Message.void(self.link, self.invalidate);
         Runtime.objc_setAssociatedObject(
             self.delegate,

@@ -295,7 +295,7 @@ App* = {
         Ok(())
     }
 
-    close* = (self :: @Self) () {
+    close* = (self :: @Self) {
         self.close_requests.match({Ok(requests) => { owner ::= requests; owner.close(); }, None => ()});
         self.close_requests = None;
         self.pacer.close();
@@ -400,7 +400,7 @@ App* = {
         Ok(())
     }
 
-    allow_capture* = (self :: @Self, enabled: bool) () { self.capture_enabled = enabled; }
+    allow_capture* = (self :: @Self, enabled: bool) { self.capture_enabled = enabled; }
 
     take_key* = (self :: @Self) Res<KeyEvent> {
         result           = self.pending_key;
@@ -700,11 +700,11 @@ App* = {
     }
 
     // Host application owns DSP and model work between ticks.
-    voice_pitch* = (self :: @Self, mean: f64, low: f64, high: f64) () {
+    voice_pitch* = (self :: @Self, mean: f64, low: f64, high: f64) {
         self.voice_mean = mean; self.voice_low = low; self.voice_high = high;
     }
 
-    spectrum* = (self: @Self, values: Ptr<f64>) () {
+    spectrum* = (self: @Self, values: Ptr<f64>) {
         self.levels.copy_from(values, 32);
     }
 
